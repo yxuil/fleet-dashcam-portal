@@ -35,8 +35,29 @@ import { useAuditEmitter } from "@/hooks/useAuditEmitter";
 import { useClipDetail } from "@/hooks/useClipDetail";
 import { useClipEvents } from "@/hooks/useClipEvents";
 import { ApiError } from "@/lib/api";
+import { API_BASE } from "@/lib/env";
 import type { ClipDetail, EventRow } from "@/lib/types";
 import { cn } from "@/lib/utils";
+
+/**
+ * Resolve a backend-issued `playback_url` to something the browser can
+ * actually load.
+ *
+ * In `STORAGE_BACKEND=local` mode the backend returns a relative path like
+ * `/clips/{id}/stream` so it stays origin-agnostic. The frontend dev
+ * server runs on `:5173` and the API on `:8000`, so a bare relative URL
+ * on `<video src>` would 404 against Vite. Prefix with `API_BASE` so the
+ * video element actually hits the backend.
+ *
+ * In `STORAGE_BACKEND=s3` mode the URL is already absolute (a signed S3
+ * URL); we pass it through unchanged.
+ */
+function resolvePlaybackUrl(url: string | null | undefined): string | undefined {
+  if (!url) return undefined;
+  if (/^https?:\/\//i.test(url)) return url;
+  if (url.startsWith("/")) return `${API_BASE}${url}`;
+  return url;
+}
 
 // One 30fps frame, in seconds. Used by the ←/→ frame-step keybinds.
 const FRAME_STEP_S = 1 / 30;
@@ -270,7 +291,7 @@ function ClipPageBody({ detail, events, audit }: BodyProps) {
             ref={videoRef}
             controls
             preload="metadata"
-            src={detail.playback_url ?? undefined}
+            src={resolvePlaybackUrl(detail.playback_url)}
             data-testid="clip-video"
             className="aspect-video w-full rounded-md bg-black"
             onTimeUpdate={(e) =>

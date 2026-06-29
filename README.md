@@ -9,8 +9,10 @@ workflow. Authentication is owned upstream; the portal trusts an
 `Authorization: Bearer <jwt>` header (with a dev-only escape hatch, below).
 
 Backend is FastAPI + SQLAlchemy + Alembic over async Postgres. Frontend is
-React 19 + Vite + Tailwind + React Query. Object storage is MinIO in dev
-(S3 in prod). The feature design lives at
+React 19 + Vite + Tailwind + React Query. Clip storage is **local
+filesystem in dev by default** (under `backend/var/clips/...`) with an
+S3/MinIO mode preserved behind `STORAGE_BACKEND=s3` for prod or
+integration work. The feature design lives at
 [`docs/plans/2026-06-29-dashcam-portal-design.md`](docs/plans/2026-06-29-dashcam-portal-design.md).
 
 ## Prerequisites
@@ -34,14 +36,16 @@ backend and frontend dev servers both run in the foreground.
 cp .env.example .env
 cp frontend/.env.example frontend/.env.local
 
-# 2. Bring up Postgres + MinIO (the `minio-init` job creates the bucket).
+# 2. Bring up Postgres (and MinIO, only used if you flip STORAGE_BACKEND=s3).
 docker compose -f infra/docker-compose.dev.yml up -d
 
 # 3. Install backend deps, apply migrations, seed the database.
+#    Drop sample MP4s into ../samples/*.mp4 first to get playable video;
+#    the seed will symlink each clip's storage path round-robin to a sample.
 cd backend
 uv sync
 uv run alembic upgrade head
-uv run python -m app.seed --reset --no-upload-samples
+uv run python -m app.seed --reset
 
 # 4. Start the backend (FastAPI on :8000). Leave this running.
 uv run uvicorn app.main:app --reload
@@ -53,7 +57,9 @@ npm run dev
 ```
 
 Open http://localhost:5173. The bottom-right corner shows a dev-user picker;
-pick any seeded user and the app loads with that tenant's data.
+pick any seeded user and the app loads with that tenant's data. Click any
+clip card and the player fetches MP4 bytes from
+`GET http://localhost:8000/clips/{id}/stream` (local mode).
 
 ## Repo layout
 
@@ -156,12 +162,13 @@ Flags:
 
 - `--reset` truncates every app table in FK-safe order before seeding. Without
   it, a second run will collide on uniqueness constraints.
-- `--upload-samples` (default) tries to upload every `samples/*.mp4` to MinIO
-  round-robin. Failures (no samples present, MinIO down) are non-fatal — the
-  DB rows still get a canonical `storage_key`.
-- `--no-upload-samples` skips MinIO entirely. Clips still play in the UI
-  insofar as MinIO returns a signed URL, but the response body is a 404 until
-  you drop real MP4s into `samples/` and reseed with `--upload-samples`.
+- `--upload-samples` (default) attaches sample bytes to each clip's
+  `storage_key`. In `STORAGE_BACKEND=local` mode this **symlinks** every
+  clip's on-disk path round-robin to a `samples/*.mp4`, so 200 clips share
+  7 real files. In `STORAGE_BACKEND=s3` mode it uploads to MinIO. Failures
+  (no samples present, MinIO down) are non-fatal — the DB rows still get
+  a canonical `storage_key`.
+- `--no-upload-samples` skips the bytes/symlinks entirely; DB rows only.
 
 Sample MP4s are **not** committed. Drop any short H.264/AAC MP4 into
 `samples/` (any filename, just `*.mp4`) to get playable video — see
@@ -214,17 +221,39 @@ GET    /healthz
 
 ### Backend (`/.env`)
 
-| Var             | Default                                                   | Notes                                                    |
-| --------------- | --------------------------------------------------------- | -------------------------------------------------------- |
-| `APP_ENV`       | `dev`                                                     | Set to anything else to disable the `X-Dev-*` shortcut. |
-| `DATABASE_URL`  | `postgresql+asyncpg://dashcam:dashcam@localhost:5432/dashcam` | asyncpg driver required.                                |
-| `JWT_SECRET`    | `dev-secret-change-me`                                    | HS256 shared secret with the upstream IdP.              |
-| `JWT_ALGORITHM` | `HS256`                                                   | Only HS256 supported today.                             |
-| `S3_ENDPOINT`   | `http://localhost:9000`                                   | MinIO endpoint in dev.                                  |
-| `S3_ACCESS_KEY` | `minioadmin`                                              | MinIO root user in dev.                                 |
-| `S3_SECRET_KEY` | `minioadmin`                                              | MinIO root password in dev.                             |
-| `S3_BUCKET`     | `dashcam-clips`                                           | Created by the `minio-init` compose job.                |
-| `S3_REGION`     | `us-east-1`                                               | Required by boto3 even against MinIO.                   |
+| Var               | Default                                                       | Notes                                                                |
+| ----------------- | ------------------------------------------------------------- | -------------------------------------------------------------------- |
+| `APP_ENV`         | `dev`                                                         | Set to anything else to disable the `X-Dev-*` shortcut.              |
+| `DATABASE_URL`    | `postgresql+asyncpg://dashcam:dashcam@localhost:5432/dashcam` | asyncpg driver required.                                             |
+| `JWT_SECRET`      | `dev-secret-change-me`                                        | HS256 shared secret with the upstream IdP.                           |
+| `JWT_ALGORITHM`   | `HS256`                                                       | Only HS256 supported today.                                          |
+| `STORAGE_BACKEND` | `local`                                                       | `local` (filesystem, default) or `s3`. See **Storage backends** below. |
+| `STORAGE_ROOT`    | `./var/clips`                                                 | Filesystem root for local mode. Resolved from the backend cwd.       |
+| `S3_ENDPOINT`     | `http://localhost:9000`                                       | MinIO endpoint. Only used when `STORAGE_BACKEND=s3`.                 |
+| `S3_ACCESS_KEY`   | `minioadmin`                                                  | MinIO root user. Only used when `STORAGE_BACKEND=s3`.                |
+| `S3_SECRET_KEY`   | `minioadmin`                                                  | MinIO root password. Only used when `STORAGE_BACKEND=s3`.            |
+| `S3_BUCKET`       | `dashcam-clips`                                               | Created by the `minio-init` compose job.                             |
+| `S3_REGION`       | `us-east-1`                                                   | Required by boto3 even against MinIO.                                |
+
+## Storage backends
+
+The portal supports two interchangeable clip-storage backends, selected by
+`STORAGE_BACKEND` in `backend/.env`:
+
+- **`local` (default).** Clip MP4s live under `STORAGE_ROOT/{tenant_id}/{yyyy}/{mm}/{dd}/{clip_id}.mp4`.
+  Playback goes through the backend route `GET /clips/{id}/stream`, served
+  via `FileResponse` with native HTTP Range support so the `<video>`
+  element can scrub. Auth is the normal `current_user` dep — same tenant
+  scoping as every other route. Best for solo dev: no MinIO container,
+  no signed URLs to expire mid-debug.
+- **`s3`.** Clip MP4s live in MinIO/S3. `GET /clips/{id}?play=true` mints
+  a SigV4 presigned GET URL with a 1-hour TTL and writes
+  `clip.play_url_minted`; the browser fetches bytes directly from
+  MinIO/S3. Best for prod-shaped integration work.
+
+Switching is a single env var; restart the backend to pick it up. The
+seed script (`python -m app.seed --reset`) DTRT for whichever mode is
+active — symlinking sample MP4s in `local`, uploading them in `s3`.
 
 ### Frontend (`frontend/.env.local`)
 

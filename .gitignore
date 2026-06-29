@@ -49,3 +49,6 @@ playwright/.cache/
 
 # Docker / data volumes
 infra/data/
+
+# Local-mode clip storage (STORAGE_BACKEND=local)
+backend/var/

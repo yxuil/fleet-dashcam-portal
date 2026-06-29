@@ -1,23 +1,28 @@
 """Integration + unit tests for ``app.storage``.
 
-Most of these tests require a running MinIO at ``settings.s3_endpoint``;
-they're skipped (not failed) if it isn't reachable, so the suite stays
-green on a fresh checkout where the dev compose hasn't been started.
+The module supports two backends: ``local`` (files on disk under
+``settings.storage_root``) and ``s3`` (MinIO/S3 via boto3). Tests are
+grouped accordingly:
 
-The pure helpers (``build_clip_key``, ``_validate_tenant_prefix``) and the
-input-validation in ``get_signed_url`` are tested without any network.
+* Pure helpers (``build_clip_key``, ``_validate_tenant_prefix``) — no I/O.
+* ``put_object`` / ``ensure_bucket`` in local mode — write to a tmp dir.
+* ``get_playback_url`` — both modes, parametrized.
+* ``get_signed_url`` integration — requires MinIO; skipped if unreachable.
 """
 
 from __future__ import annotations
 
 import socket
+from collections.abc import Iterator
 from datetime import UTC, datetime
+from pathlib import Path
 from urllib.parse import urlparse
 from uuid import UUID, uuid4
 
 import httpx
 import pytest
 
+from app import storage as storage_module
 from app.config import settings
 from app.storage import (
     DEFAULT_SIGNED_URL_TTL_S,
@@ -25,13 +30,14 @@ from app.storage import (
     _validate_tenant_prefix,
     build_clip_key,
     ensure_bucket,
+    get_playback_url,
     get_s3_client,
     get_signed_url,
     put_object,
 )
 
 # ---------------------------------------------------------------------------
-# Reachability gate — every integration test depends on this.
+# Reachability gate — s3 integration tests depend on this.
 # ---------------------------------------------------------------------------
 
 
@@ -52,14 +58,38 @@ def _minio_reachable() -> bool:
         return False
 
 
-requires_minio = pytest.mark.skipif(
-    not _minio_reachable(),
-    reason=f"MinIO not reachable at {settings.s3_endpoint}",
+_MINIO_REACHABLE = _minio_reachable()
+
+# S3 integration tests require BOTH the s3 backend selected AND MinIO up.
+# Either gate alone isn't enough: with backend=local the s3 helper paths
+# are deliberately unreachable from public funcs, and with MinIO down boto3
+# would error out before any tenant check we want to exercise.
+requires_s3 = pytest.mark.skipif(
+    not (settings.storage_backend == "s3" and _MINIO_REACHABLE),
+    reason=(
+        f"Requires STORAGE_BACKEND=s3 (got {settings.storage_backend!r}) and "
+        f"MinIO reachable at {settings.s3_endpoint}"
+    ),
 )
 
 
+@pytest.fixture
+def local_storage_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[Path]:
+    """Point ``settings.storage_root`` at a fresh tmp dir for local-mode tests.
+
+    We also force ``storage_backend="local"`` so a test running in an
+    environment that defaults to s3 still exercises the local path.
+    """
+    monkeypatch.setattr(settings, "storage_backend", "local")
+    monkeypatch.setattr(settings, "storage_root", tmp_path)
+    yield tmp_path
+
+
 # ---------------------------------------------------------------------------
-# Pure helper tests (no network)
+# Pure helper tests (no I/O)
 # ---------------------------------------------------------------------------
 
 
@@ -160,7 +190,9 @@ async def test_get_signed_url_rejects_cross_tenant_without_network() -> None:
 
 
 @pytest.mark.asyncio
-async def test_put_object_rejects_cross_tenant_without_network() -> None:
+async def test_put_object_rejects_cross_tenant_without_network(
+    local_storage_root: Path,
+) -> None:
     tenant_a = uuid4()
     tenant_b = uuid4()
     key_for_b = f"{tenant_b}/2026/06/29/{uuid4()}.mp4"
@@ -169,11 +201,136 @@ async def test_put_object_rejects_cross_tenant_without_network() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Integration tests against real MinIO
+# Local-mode tests (no network)
 # ---------------------------------------------------------------------------
 
 
-@requires_minio
+@pytest.mark.asyncio
+async def test_local_put_object_writes_file_under_storage_root(
+    local_storage_root: Path,
+) -> None:
+    """Local-mode put_object lands the bytes under STORAGE_ROOT/key."""
+    tenant_id = uuid4()
+    clip_id = uuid4()
+    key = build_clip_key(
+        tenant_id, datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC), clip_id
+    )
+    payload = b"local-clip-bytes-" + clip_id.bytes
+
+    await put_object(tenant_id, key, payload, content_type="video/mp4")
+
+    target = local_storage_root / key
+    assert target.is_file()
+    assert target.read_bytes() == payload
+
+
+@pytest.mark.asyncio
+async def test_local_put_object_rejects_cross_tenant_prefix(
+    local_storage_root: Path,
+) -> None:
+    """Local-mode still enforces the tenant-prefix check before touching disk."""
+    tenant_a = uuid4()
+    tenant_b = uuid4()
+    key_for_b = f"{tenant_b}/2026/06/29/{uuid4()}.mp4"
+
+    with pytest.raises(ValueError, match="does not belong to caller's tenant"):
+        await put_object(tenant_a, key_for_b, b"payload")
+
+    # Nothing should have been written under either tenant's prefix.
+    assert not (local_storage_root / key_for_b).exists()
+
+
+@pytest.mark.asyncio
+async def test_local_ensure_bucket_creates_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """In local mode, ensure_bucket mkdirs STORAGE_ROOT (parents=True)."""
+    root = tmp_path / "deeply" / "nested" / "clips"
+    monkeypatch.setattr(settings, "storage_backend", "local")
+    monkeypatch.setattr(settings, "storage_root", root)
+
+    assert not root.exists()
+    await ensure_bucket()
+    assert root.is_dir()
+    # Idempotent.
+    await ensure_bucket()
+    assert root.is_dir()
+
+
+# ---------------------------------------------------------------------------
+# get_playback_url — both modes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_playback_url_local_mode_returns_stream_route(
+    local_storage_root: Path,
+) -> None:
+    """Local-mode playback URL is the relative router path; no signing."""
+    tenant_id = uuid4()
+    clip_id = uuid4()
+    key = build_clip_key(
+        tenant_id, datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC), clip_id
+    )
+
+    url = await get_playback_url(tenant_id=tenant_id, key=key, clip_id=clip_id)
+    assert url == f"/clips/{clip_id}/stream"
+
+
+@pytest.mark.asyncio
+async def test_get_playback_url_local_mode_rejects_cross_tenant(
+    local_storage_root: Path,
+) -> None:
+    """Cross-tenant prefix is still rejected even though local mode doesn't sign."""
+    tenant_a = uuid4()
+    tenant_b = uuid4()
+    clip_id = uuid4()
+    key_for_b = f"{tenant_b}/2026/06/29/{clip_id}.mp4"
+    with pytest.raises(ValueError, match="does not belong to caller's tenant"):
+        await get_playback_url(tenant_id=tenant_a, key=key_for_b, clip_id=clip_id)
+
+
+@pytest.mark.asyncio
+async def test_get_playback_url_s3_mode_delegates_to_signed_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S3-mode playback URL routes through ``get_signed_url`` with the same args."""
+    monkeypatch.setattr(settings, "storage_backend", "s3")
+
+    sentinel = "https://signed.example.test/x.mp4?sig=stub"
+    seen: dict[str, object] = {}
+
+    async def fake_signed(
+        tenant_id: UUID, key: str, expires_s: int = DEFAULT_SIGNED_URL_TTL_S
+    ) -> str:
+        seen["tenant_id"] = tenant_id
+        seen["key"] = key
+        seen["expires_s"] = expires_s
+        return sentinel
+
+    monkeypatch.setattr(storage_module, "get_signed_url", fake_signed)
+
+    tenant_id = uuid4()
+    clip_id = uuid4()
+    key = build_clip_key(
+        tenant_id, datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC), clip_id
+    )
+
+    url = await get_playback_url(
+        tenant_id=tenant_id, key=key, clip_id=clip_id, expires_s=123
+    )
+
+    assert url == sentinel
+    assert seen == {"tenant_id": tenant_id, "key": key, "expires_s": 123}
+
+
+# ---------------------------------------------------------------------------
+# S3 integration tests against real MinIO (skipped unless backend=s3 + MinIO up).
+# ---------------------------------------------------------------------------
+
+
+@requires_s3
 @pytest.mark.asyncio
 async def test_ensure_bucket_is_idempotent() -> None:
     # The compose ``minio-init`` job already created the bucket; calling
@@ -182,7 +339,7 @@ async def test_ensure_bucket_is_idempotent() -> None:
     await ensure_bucket()
 
 
-@requires_minio
+@requires_s3
 @pytest.mark.asyncio
 async def test_put_then_signed_url_roundtrip() -> None:
     """End-to-end: upload bytes, sign a URL, GET it, verify body."""
@@ -214,7 +371,7 @@ async def test_put_then_signed_url_roundtrip() -> None:
         client.delete_object(Bucket=settings.s3_bucket, Key=key)
 
 
-@requires_minio
+@requires_s3
 @pytest.mark.asyncio
 async def test_signed_url_default_ttl_is_one_hour() -> None:
     """Default TTL constant is documented as 1h; verify the constant
@@ -229,7 +386,7 @@ async def test_signed_url_default_ttl_is_one_hour() -> None:
     assert f"X-Amz-Expires={DEFAULT_SIGNED_URL_TTL_S}" in url
 
 
-@requires_minio
+@requires_s3
 @pytest.mark.asyncio
 async def test_cross_tenant_signing_raises_against_real_backend() -> None:
     """Repeats the unit-level cross-tenant check, but with the real

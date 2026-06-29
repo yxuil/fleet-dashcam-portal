@@ -20,8 +20,9 @@
  *     (locator interactions wait for actionability) plus `expect().toBeVisible()`
  *     with a generous timeout covers the legitimate async gaps.
  *   - Scenario (a)'s video assertion is intentionally lax: we just check the
- *     `<video>` got a MinIO-pointing `src`. Headless Chromium may not
- *     successfully decode an empty-or-absent object from MinIO, and that
+ *     `<video>` got a backend-pointing `src` (local-mode stream route on
+ *     :8000 in the T17 default, or a MinIO URL on :9000 in s3 mode).
+ *     Headless Chromium may not successfully decode every clip, and that
  *     isn't what we're testing — the audit row IS the assertion that the
  *     play URL was minted server-side.
  */
@@ -108,14 +109,16 @@ test("(a) search → play clip → audit shows play_url_minted", async ({
   // Land on detail.
   await expect(page).toHaveURL(new RegExp(`/clips/${clip.id}$`));
 
-  // The video element should mount with a MinIO-pointing src once the
-  // detail GET resolves. Use the testid + an attribute matcher rather than
-  // jsdom-style getElementsBy because Playwright runs in a real browser.
+  // The video element should mount with a backend-pointing src once the
+  // detail GET resolves. In local-storage mode (T17 default) the URL is
+  // the relative stream route prefixed with API_BASE; in s3 mode it'd be
+  // a MinIO signed URL. Accept either shape — the audit row below is the
+  // load-bearing assertion.
   const video = page.getByTestId("clip-video");
   await expect(video).toBeVisible({ timeout: 10_000 });
   await expect(video).toHaveAttribute(
     "src",
-    /^http:\/\/localhost:9000\//,
+    /^http:\/\/localhost:(8000\/clips\/[0-9a-f-]+\/stream|9000\/)/,
     { timeout: 10_000 },
   );
 

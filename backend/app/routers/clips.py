@@ -1,4 +1,4 @@
-"""``GET /clips`` and ``GET /clips/{id}`` — clip list + detail with signed playback.
+"""``GET /clips``, ``GET /clips/{id}``, ``GET /clips/{id}/stream`` — clip list, detail, playback.
 
 Filtering on the list endpoint
 ------------------------------
@@ -11,10 +11,21 @@ Filtering on the list endpoint
 Detail endpoint
 ---------------
 ``GET /clips/{id}`` returns metadata only by default. Pass ``?play=true``
-to mint a fresh ``DEFAULT_SIGNED_URL_TTL_S``-second signed playback URL
-and write an audit row (``action="clip.play_url_minted"``). The audit row
-is part of the same transaction as the read — if anything fails before
-commit, the audit doesn't persist.
+to mint a fresh playback URL and write an audit row
+(``action="clip.play_url_minted"``). The audit row is part of the same
+transaction as the read — if anything fails before commit, the audit
+doesn't persist. The URL shape depends on ``settings.storage_backend``:
+in ``local`` mode it's the relative path ``"/clips/{id}/stream"``; in
+``s3`` mode it's a SigV4 presigned GET URL.
+
+Stream endpoint
+---------------
+``GET /clips/{id}/stream`` serves the MP4 bytes from disk via
+``FileResponse`` (with native HTTP Range support for scrubbing). Only
+used in ``local`` mode; in ``s3`` mode the browser hits MinIO/S3 directly
+via the signed URL and this route is unused. No audit row is written
+here — ``clip.play_url_minted`` on the sibling detail call already
+captures playback intent.
 
 Tenant isolation
 ----------------
@@ -27,11 +38,14 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 from datetime import datetime
+from pathlib import Path
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -39,12 +53,13 @@ from sqlalchemy.orm import selectinload
 
 from app.audit import record as audit_record
 from app.auth import Principal, current_user
+from app.config import settings
 from app.db import get_session
 from app.models.clip import Clip
 from app.models.driver import Driver
 from app.models.truck import Truck
 from app.schemas.clip import ClipDetail, ClipListResponse, ClipRow
-from app.storage import DEFAULT_SIGNED_URL_TTL_S, get_signed_url
+from app.storage import DEFAULT_SIGNED_URL_TTL_S, get_playback_url
 
 router = APIRouter(tags=["clips"])
 
@@ -219,9 +234,10 @@ async def get_clip(
             target_id=clip.id,
             payload={"signed_url_ttl_s": DEFAULT_SIGNED_URL_TTL_S},
         )
-        url = await get_signed_url(
-            principal.tenant_id,
-            clip.storage_key,
+        url = await get_playback_url(
+            tenant_id=principal.tenant_id,
+            key=clip.storage_key,
+            clip_id=clip.id,
             expires_s=DEFAULT_SIGNED_URL_TTL_S,
         )
         await session.commit()
@@ -229,6 +245,98 @@ async def get_clip(
         detail = detail.model_copy(update={"playback_url": url})
 
     return detail
+
+
+# ---------------------------------------------------------------------------
+# Local-mode playback streaming
+# ---------------------------------------------------------------------------
+
+
+@router.get("/clips/{clip_id}/stream")
+async def stream_clip(
+    clip_id: UUID,
+    principal: Annotated[Principal, Depends(current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> FileResponse:
+    """Stream a clip's MP4 bytes from the local filesystem.
+
+    Used in ``storage_backend="local"`` mode in place of a signed S3 URL.
+    Tenant scoping happens twice: once via the SQL ``WHERE`` (so a clip
+    belonging to another tenant returns 404), and again as a defence-in-depth
+    path-traversal check after resolving the on-disk path.
+
+    No audit row is written here — the browser may issue many HTTP Range
+    requests per playback, and ``clip.play_url_minted`` (written by the
+    sibling ``GET /clips/{id}?play=true``) already records the playback
+    intent. The player-side ``POST /clips/{id}/audit`` captures ``clip.play``
+    and ``clip.scrub`` events with finer granularity.
+
+    Returns:
+        A :class:`FastAPI.FileResponse` with ``media_type="video/mp4"``.
+        Starlette adds ``Accept-Ranges: bytes`` and handles ``Range``
+        requests natively, which is what the ``<video>`` element needs
+        to scrub.
+    """
+    stmt = select(Clip).where(
+        Clip.id == clip_id, Clip.tenant_id == principal.tenant_id
+    )
+    result = await session.execute(stmt)
+    clip = result.scalar_one_or_none()
+    if clip is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="not found",
+        )
+
+    # Resolve the on-disk path. We resolve *without* following symlinks
+    # because the seed creates each clip target as a symlink into the
+    # repo's ``samples/`` directory — following links here would push the
+    # final path outside ``STORAGE_ROOT`` and trip the containment check
+    # below for legitimate clips. ``os.path.normpath`` collapses ``..``
+    # segments so a malformed key like ``{tenant}/../../etc`` still gets
+    # caught by the containment assertion.
+    root = Path(settings.storage_root).resolve()
+    # Use ``os.path.normpath`` to flatten ``..`` traversal without resolving
+    # symlinks. Then re-wrap in ``Path`` for the containment + existence checks.
+    raw = root / clip.storage_key
+    candidate = Path(os.path.normpath(raw))
+
+    # Defence-in-depth: the tenant-prefix check on ``storage_key`` already
+    # prevents this in practice, but if a malformed key ever slipped in
+    # (e.g. via a future ingest path that forgot to validate), this
+    # ensures we never serve a file outside the storage root.
+    if not _is_relative_to(candidate, root):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="not found",
+        )
+
+    # ``exists()`` follows symlinks, which is what we want — a clip whose
+    # symlink target was removed is effectively missing.
+    if not candidate.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="not found",
+        )
+
+    return FileResponse(
+        path=str(candidate),
+        media_type="video/mp4",
+        filename=f"{clip.id}.mp4",
+    )
+
+
+def _is_relative_to(child: Path, parent: Path) -> bool:
+    """Backport of ``Path.is_relative_to`` (added in 3.9) for clarity.
+
+    ``Path.is_relative_to`` exists on 3.9+, but we wrap it so the call
+    site reads as a security check rather than a path manipulation.
+    """
+    try:
+        child.relative_to(parent)
+    except ValueError:
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------

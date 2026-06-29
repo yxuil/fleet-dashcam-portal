@@ -67,7 +67,7 @@ Everything else (auth, storage, audit, schemas) is *plumbing* in service of thes
 | ORM | **SQLAlchemy 2.0** (async) | Mature, supports Postgres-native ENUMs / JSONB / advisory locks. The 2.0 typing (`Mapped[T]`, `mapped_column`) gives mypy real teeth. |
 | Migrations | **Alembic** | Async env wired in `backend/migrations/env.py`. Auto-generate is enabled. |
 | DB | **Postgres 16** | Native ENUMs, JSONB, advisory locks for `(tenant, year)` serialisation. |
-| Object store | **MinIO** (S3-compatible) | Same API as AWS S3 — switching to real S3 in prod is just env vars. We sign URLs with sigv4. |
+| Object store | **Local filesystem** (default in dev) or **MinIO** (S3-compatible) | The `storage` module branches on `STORAGE_BACKEND`. Local mode serves bytes via `GET /clips/{id}/stream` with HTTP Range; S3 mode mints SigV4 presigned URLs. Switching is a single env var. |
 | Auth | **JWT (HS256)** + dev-header shortcut | Portal does not mint tokens; an upstream IdP does. Dev headers bypass JWT only when `APP_ENV=dev`. |
 | Frontend framework | **React 19 + Vite + TypeScript** | Vite for fast dev. TS strict, including `verbatimModuleSyntax`. |
 | Styling | **Tailwind v3** + hand-rolled shadcn-style primitives | We chose to *not* depend on Radix to keep the dep tree small. The two primitives we use (`Button`, `Dropdown`) live in `frontend/src/components/ui/`. |
@@ -90,7 +90,7 @@ dashcam/
 │   │   ├── config.py           ← Pydantic-settings, env-driven
 │   │   ├── db.py               ← Async engine, session factory, get_session dep
 │   │   ├── auth.py             ← Principal model + current_user dep
-│   │   ├── storage.py          ← S3/MinIO adapter, tenant-prefixed keys
+│   │   ├── storage.py          ← local-fs / S3 adapter, tenant-prefixed keys
 │   │   ├── audit.py            ← record() + record_system() + AuditEntry schema
 │   │   ├── seed.py             ← CLI: python -m app.seed --reset
 │   │   ├── models/             ← SQLAlchemy 2.0 models (one per aggregate)
@@ -156,7 +156,7 @@ Note three things:
 - The 404 detail is **exactly** `"not found"` — not "case not found" (would still leak), not "forbidden" (would leak that *something* exists).
 - `selectinload` pre-loads the relationships you'll use. We set `lazy="raise"` on relationships in `models/` so any forgotten preload **throws** instead of silently issuing N+1 queries.
 
-The storage layer enforces tenancy too — `storage._validate_tenant_prefix` refuses to sign a URL whose key doesn't start with `{tenant_id}/`. This is defence in depth: even if you slip up at the router layer, signing fails.
+The storage layer enforces tenancy too — `storage._validate_tenant_prefix` refuses to mint a playback URL whose key doesn't start with `{tenant_id}/`. This is defence in depth: even if you slip up at the router layer, the storage call fails. The stream endpoint (`GET /clips/{id}/stream`, local-mode playback) layers a second containment check: after resolving `STORAGE_ROOT / storage_key` it asserts the resolved path is still inside `STORAGE_ROOT`, so a malformed key with `..` segments yields 404 rather than serving an arbitrary file off the host.
 
 ### 4.2 The audit log (append-only by convention)
 
@@ -306,12 +306,12 @@ Trace these in the actual code with the file open. They will teach you more than
 5. Backend handler: `backend/app/routers/clips.py::list_clips`. It joins `Truck` (always) and outer-joins `Driver` (for the text filter), scopes by `principal.tenant_id`, paginates with cursor.
 6. User clicks a card → `ClipCard` calls `navigate(\`/clips/${id}\`)`.
 7. `ClipPage.tsx` mounts. `useClipDetail(id)` fires `GET /clips/{id}?play=true`.
-8. Backend: `clips.py::get_clip` loads the clip (tenant-scoped 404), calls `audit_record(... action="clip.play_url_minted" ...)`, calls `storage.get_signed_url(tenant_id, storage_key)` (which re-verifies the tenant prefix), commits, returns `ClipDetail` with `playback_url`.
-9. The page sets `<video src={playback_url}>`. The browser fetches the MP4 from MinIO using the signed URL.
+8. Backend: `clips.py::get_clip` loads the clip (tenant-scoped 404), calls `audit_record(... action="clip.play_url_minted" ...)`, calls `storage.get_playback_url(tenant_id=..., key=storage_key, clip_id=...)` (which re-verifies the tenant prefix and dispatches on `STORAGE_BACKEND`), commits, returns `ClipDetail` with `playback_url`.
+9. The page sets `<video src={playback_url}>` (the frontend prefixes a relative URL with `API_BASE`). In local mode the browser fetches `GET /clips/{id}/stream` from the backend; in s3 mode it fetches the presigned URL from MinIO directly. Either way the bytes flow back over HTTP Range requests.
 10. On mount, the page also calls `useAuditEmitter`'s `emitPlay()`, which POSTs `/clips/{id}/audit` — a different audit row marking "user actually started playback" vs "URL minted".
 11. On unmount: `emitClosed({ view_duration_s })` fires.
 
-Total moving parts: 1 React page, 2 hooks, 2 backend endpoints, 3 audit rows in postgres, 1 MinIO fetch. Read every file in the chain once.
+Total moving parts: 1 React page, 2 hooks, 2 (or 3 in local mode) backend endpoints, 3 audit rows in postgres, 1 file fetch (local stream or MinIO signed URL). Read every file in the chain once.
 
 ### 5.2 "Triage an event into a case"
 

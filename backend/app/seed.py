@@ -150,13 +150,14 @@ class SeedSummary:
     clips: int = 0
     events: int = 0
     uploaded_samples: int = 0
+    links: int = 0
 
     def as_line(self) -> str:
         return (
             f"Seed complete: tenants={self.tenants} "
             f"users={self.users} trucks={self.trucks} drivers={self.drivers} "
             f"clips={self.clips} events={self.events} "
-            f"uploads={self.uploaded_samples}"
+            f"uploads={self.uploaded_samples} links={self.links}"
         )
 
 
@@ -425,6 +426,48 @@ def _upload_samples_sync(
     return uploaded
 
 
+def _link_samples_sync(
+    clips: Iterable[Clip],
+    sample_mp4s: list[Path],
+    storage_root: Path,
+) -> int:
+    """Symlink each clip's on-disk path to a round-robin sample MP4.
+
+    Used in ``storage_backend="local"`` mode. We symlink rather than copy
+    so 200 clips share 7 real files instead of duplicating ~840 MB on disk.
+
+    Returns the number of symlinks created. Existing files or symlinks at
+    the target path are unlinked first so the operation is idempotent
+    across re-seeds.
+    """
+    root = storage_root.resolve()
+    root.mkdir(parents=True, exist_ok=True)
+
+    # Pre-resolve sample paths to absolute, so symlinks stay valid no
+    # matter where the backend cwd is at read time.
+    abs_samples = [p.resolve() for p in sample_mp4s]
+
+    linked = 0
+    for i, clip in enumerate(clips):
+        target = root / clip.storage_key
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # ``is_symlink`` returns True even for a broken link; ``exists``
+        # alone would miss those.
+        if target.is_symlink() or target.exists():
+            target.unlink()
+        sample_path = abs_samples[i % len(abs_samples)]
+        try:
+            target.symlink_to(sample_path)
+            linked += 1
+        except OSError:
+            logger.exception(
+                "failed to symlink sample %s -> %s; continuing",
+                sample_path,
+                target,
+            )
+    return linked
+
+
 # ---------------------------------------------------------------------------
 # Programmatic entry point
 # ---------------------------------------------------------------------------
@@ -435,12 +478,14 @@ async def run_seed(
     reset: bool = False,
     upload_samples: bool = True,
 ) -> SeedSummary:
-    """Seed the database (and optionally MinIO) with dev data.
+    """Seed the database (and optionally MinIO / disk) with dev data.
 
     Args:
         reset: If true, truncate all app tables first (FK-safe order).
-        upload_samples: If true and ``samples/*.mp4`` exist, upload them to
-            MinIO under each clip's storage_key. No-op if no samples.
+        upload_samples: If true and ``samples/*.mp4`` exist, attach sample
+            bytes to each seeded clip's storage_key. In ``s3`` mode this
+            uploads to MinIO; in ``local`` mode it symlinks each on-disk
+            target to a round-robin sample. No-op if no samples are present.
 
     Returns:
         A :class:`SeedSummary` for printing / assertions.
@@ -516,12 +561,20 @@ async def run_seed(
                 await session.flush()
                 summary.events += len(events)
 
-        # Upload samples *after* commit so we don't roll back DB rows when
-        # MinIO is flaky. Uploads are best-effort.
+        # Attach sample bytes *after* commit so we don't roll back DB rows
+        # when MinIO is flaky / disk fills up. Both paths are best-effort.
         if upload_samples and sample_mp4s and all_clips:
-            summary.uploaded_samples = await asyncio.to_thread(
-                _upload_samples_sync, all_clips, sample_mp4s
-            )
+            if settings.storage_backend == "local":
+                # Resolve storage_root once; the symlinker also resolves but
+                # passing it through keeps the test wiring obvious.
+                root = Path(settings.storage_root)
+                summary.links = await asyncio.to_thread(
+                    _link_samples_sync, all_clips, sample_mp4s, root
+                )
+            else:
+                summary.uploaded_samples = await asyncio.to_thread(
+                    _upload_samples_sync, all_clips, sample_mp4s
+                )
     finally:
         await engine.dispose()
 

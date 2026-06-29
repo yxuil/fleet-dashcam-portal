@@ -584,30 +584,21 @@ async def test_get_clip_by_id_returns_metadata_without_playback_url_by_default(
 
 
 @pytest.mark.asyncio
-async def test_get_clip_play_true_returns_signed_url_and_writes_audit(
+async def test_get_clip_play_true_returns_stream_route_in_local_mode(
     http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
     dev_settings: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``?play=true`` must mint a URL and append an audit row in one txn."""
+    """``?play=true`` in local mode returns the relative stream route and audits."""
     client, s = http_client_with_session
 
-    # Stub the storage layer so we don't depend on a live MinIO. The router
-    # awaits this, so we hand back a coroutine-returning fake.
-    sentinel_url = "https://signed.example.test/clip.mp4?sig=stub"
-
-    async def _fake_get_signed_url(
-        tenant_id: uuid.UUID, key: str, expires_s: int = 3600
-    ) -> str:
-        return sentinel_url
-
-    monkeypatch.setattr(
-        "app.routers.clips.get_signed_url", _fake_get_signed_url
-    )
+    # Force the storage layer into local mode for this test so the playback
+    # URL is the relative router path, not a signed S3 URL.
+    monkeypatch.setattr(settings, "storage_backend", "local")
 
     tenant = uuid.uuid4()
     await _seed_tenant(s, tenant)
-    truck = await _seed_truck(s, tenant_id=tenant, label="T-play")
+    truck = await _seed_truck(s, tenant_id=tenant, label="T-play-local")
     base = datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC)
     clip = await _seed_clip(
         s, tenant_id=tenant, truck_id=truck.id, driver_id=None, started_at=base
@@ -621,7 +612,7 @@ async def test_get_clip_play_true_returns_signed_url_and_writes_audit(
     )
     assert resp.status_code == 200, resp.text
     detail = ClipDetail.model_validate(resp.json())
-    assert detail.playback_url == sentinel_url
+    assert detail.playback_url == f"/clips/{clip.id}/stream"
 
     # Audit row must exist with the documented action / target / payload.
     audit_rows = (
@@ -651,6 +642,50 @@ async def test_get_clip_play_true_returns_signed_url_and_writes_audit(
     audit_listing = resp.json()
     assert len(audit_listing["items"]) == 1
     assert audit_listing["items"][0]["target_id"] == str(clip.id)
+
+
+@pytest.mark.asyncio
+async def test_get_clip_play_true_returns_signed_url_in_s3_mode(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same handler, but with ``storage_backend="s3"`` returns a signed URL.
+
+    Stubs ``get_signed_url`` so the suite doesn't depend on a live MinIO.
+    """
+    client, s = http_client_with_session
+
+    monkeypatch.setattr(settings, "storage_backend", "s3")
+
+    sentinel_url = "https://signed.example.test/clip.mp4?sig=stub"
+
+    async def _fake_get_signed_url(
+        tenant_id: uuid.UUID, key: str, expires_s: int = 3600
+    ) -> str:
+        return sentinel_url
+
+    # ``get_playback_url`` (in s3 mode) calls ``storage.get_signed_url`` —
+    # patch the module attribute so the indirection still resolves.
+    monkeypatch.setattr(storage_module, "get_signed_url", _fake_get_signed_url)
+
+    tenant = uuid.uuid4()
+    await _seed_tenant(s, tenant)
+    truck = await _seed_truck(s, tenant_id=tenant, label="T-play-s3")
+    base = datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC)
+    clip = await _seed_clip(
+        s, tenant_id=tenant, truck_id=truck.id, driver_id=None, started_at=base
+    )
+
+    principal = _principal(tenant_id=tenant)
+    resp = await client.get(
+        f"/clips/{clip.id}",
+        params={"play": "true"},
+        headers=_dev_headers(principal),
+    )
+    assert resp.status_code == 200, resp.text
+    detail = ClipDetail.model_validate(resp.json())
+    assert detail.playback_url == sentinel_url
 
 
 @pytest.mark.asyncio
@@ -784,6 +819,201 @@ async def test_post_clip_audit_rejects_unknown_action(
         )
     ).scalars().all()
     assert rows == []
+
+
+# ---------------------------------------------------------------------------
+# Tests — GET /clips/{id}/stream (T17, local-mode playback)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stream_endpoint_serves_file_after_local_put(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """End-to-end: write a clip via local put_object, GET /stream serves the bytes."""
+    client, s = http_client_with_session
+
+    monkeypatch.setattr(settings, "storage_backend", "local")
+    monkeypatch.setattr(settings, "storage_root", tmp_path)
+
+    tenant = uuid.uuid4()
+    await _seed_tenant(s, tenant)
+    truck = await _seed_truck(s, tenant_id=tenant, label="T-stream")
+    base = datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC)
+    clip = await _seed_clip(
+        s, tenant_id=tenant, truck_id=truck.id, driver_id=None, started_at=base
+    )
+
+    # Write a known payload through the public storage API so we exercise
+    # the same code path the seed uses (sans symlink).
+    payload = b"\x00\x01\x02\x03local-stream-payload"
+    await storage_module.put_object(tenant, clip.storage_key, payload)
+
+    principal = _principal(tenant_id=tenant)
+    resp = await client.get(
+        f"/clips/{clip.id}/stream",
+        headers=_dev_headers(principal),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.headers.get("content-type") == "video/mp4"
+    # Starlette's FileResponse advertises range support, which the
+    # ``<video>`` element relies on for scrubbing.
+    assert resp.headers.get("accept-ranges") == "bytes"
+    assert resp.content == payload
+
+
+@pytest.mark.asyncio
+async def test_stream_endpoint_supports_range_requests(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """A ``Range: bytes=0-9`` request returns 206 with the requested slice."""
+    client, s = http_client_with_session
+
+    monkeypatch.setattr(settings, "storage_backend", "local")
+    monkeypatch.setattr(settings, "storage_root", tmp_path)
+
+    tenant = uuid.uuid4()
+    await _seed_tenant(s, tenant)
+    truck = await _seed_truck(s, tenant_id=tenant, label="T-range")
+    base = datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC)
+    clip = await _seed_clip(
+        s, tenant_id=tenant, truck_id=truck.id, driver_id=None, started_at=base
+    )
+    payload = bytes(range(64))  # 64 bytes 0x00..0x3f
+    await storage_module.put_object(tenant, clip.storage_key, payload)
+
+    principal = _principal(tenant_id=tenant)
+    resp = await client.get(
+        f"/clips/{clip.id}/stream",
+        headers={**_dev_headers(principal), "Range": "bytes=0-9"},
+    )
+    assert resp.status_code == 206, resp.text
+    assert resp.content == payload[:10]
+
+
+@pytest.mark.asyncio
+async def test_stream_endpoint_returns_404_for_cross_tenant(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """Tenant B requesting tenant A's stream gets 404 even if the file exists."""
+    client, s = http_client_with_session
+
+    monkeypatch.setattr(settings, "storage_backend", "local")
+    monkeypatch.setattr(settings, "storage_root", tmp_path)
+
+    tenant_a = uuid.uuid4()
+    tenant_b = uuid.uuid4()
+    await _seed_tenant(s, tenant_a)
+    await _seed_tenant(s, tenant_b)
+
+    truck_a = await _seed_truck(s, tenant_id=tenant_a, label="T-A-stream")
+    base = datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC)
+    clip_a = await _seed_clip(
+        s, tenant_id=tenant_a, truck_id=truck_a.id, driver_id=None, started_at=base
+    )
+    await storage_module.put_object(tenant_a, clip_a.storage_key, b"a-only")
+
+    principal_b = _principal(tenant_id=tenant_b)
+    resp = await client.get(
+        f"/clips/{clip_a.id}/stream",
+        headers=_dev_headers(principal_b),
+    )
+    assert resp.status_code == 404, resp.text
+    detail = resp.json().get("detail", "")
+    assert "forbid" not in str(detail).lower()
+
+
+@pytest.mark.asyncio
+async def test_stream_endpoint_returns_404_when_file_missing(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """A clip row whose on-disk file is absent returns 404 (not 500)."""
+    client, s = http_client_with_session
+
+    monkeypatch.setattr(settings, "storage_backend", "local")
+    monkeypatch.setattr(settings, "storage_root", tmp_path)
+
+    tenant = uuid.uuid4()
+    await _seed_tenant(s, tenant)
+    truck = await _seed_truck(s, tenant_id=tenant, label="T-missing")
+    base = datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC)
+    clip = await _seed_clip(
+        s, tenant_id=tenant, truck_id=truck.id, driver_id=None, started_at=base
+    )
+    # Intentionally do NOT write any bytes — exercises the "row exists,
+    # file doesn't" branch.
+
+    principal = _principal(tenant_id=tenant)
+    resp = await client.get(
+        f"/clips/{clip.id}/stream",
+        headers=_dev_headers(principal),
+    )
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.asyncio
+async def test_stream_endpoint_blocks_path_traversal(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """Synthesize a malicious storage_key with ``../`` and confirm 404.
+
+    The tenant-prefix check on storage_key creation already prevents this
+    in practice, but the router's resolved-path containment check is
+    defence-in-depth: if a future ingest path ever forgot to validate,
+    we'd still refuse to serve a file outside STORAGE_ROOT.
+    """
+    client, s = http_client_with_session
+
+    monkeypatch.setattr(settings, "storage_backend", "local")
+    monkeypatch.setattr(settings, "storage_root", tmp_path)
+
+    # Plant a sensitive file *outside* STORAGE_ROOT.
+    outside = tmp_path.parent / "secret.mp4"
+    outside.write_bytes(b"do-not-leak")
+
+    tenant = uuid.uuid4()
+    await _seed_tenant(s, tenant)
+    truck = await _seed_truck(s, tenant_id=tenant, label="T-trav")
+    base = datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC)
+    # Bypass the seeding helper's default key by passing a hand-crafted
+    # traversal key. We have to start with ``{tenant}/`` to pass the
+    # storage_key shape check at the model boundary (it has no validator,
+    # but downstream put_object would refuse it — here we just want a row
+    # that points outside the root when joined).
+    bad_key = f"{tenant}/../../secret.mp4"
+    clip = await _seed_clip(
+        s,
+        tenant_id=tenant,
+        truck_id=truck.id,
+        driver_id=None,
+        started_at=base,
+        storage_key=bad_key,
+    )
+
+    principal = _principal(tenant_id=tenant)
+    resp = await client.get(
+        f"/clips/{clip.id}/stream",
+        headers=_dev_headers(principal),
+    )
+    # Either 404 (file containment check) is the only acceptable outcome.
+    assert resp.status_code == 404, resp.text
+    # And we definitely did not serve the planted bytes.
+    assert resp.content != b"do-not-leak"
 
 
 @pytest.mark.asyncio

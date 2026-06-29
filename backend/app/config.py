@@ -1,3 +1,6 @@
+from pathlib import Path
+from typing import Literal
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -14,6 +17,18 @@ class Settings(BaseSettings):
 
     jwt_secret: str = "dev-secret-change-me"
     jwt_algorithm: str = "HS256"
+
+    # Storage backend selection.
+    # - ``local`` (default): clip MP4s live on disk under ``storage_root``;
+    #   playback is served by ``GET /clips/{id}/stream`` via FileResponse.
+    # - ``s3``: clip MP4s live in MinIO/S3; playback is a SigV4 presigned
+    #   GET URL minted on demand.
+    storage_backend: Literal["local", "s3"] = "local"
+
+    # Filesystem root for local-mode clip storage. Resolved relative to the
+    # backend process's cwd. Created on demand by ``ensure_bucket`` in local
+    # mode; ignored in s3 mode.
+    storage_root: Path = Path("./var/clips")
 
     s3_endpoint: str = "http://localhost:9000"
     s3_access_key: str = "minioadmin"

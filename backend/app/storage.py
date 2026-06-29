@@ -1,25 +1,35 @@
-"""S3/MinIO storage adapter with tenant-scoped keys.
+"""Storage adapter — local filesystem or S3/MinIO, gated on settings.
 
-This module is the single security boundary between the portal and object
+This module is the single security boundary between the portal and clip
 storage. Every public function takes a ``tenant_id`` and verifies that the
-S3 key it is about to touch lives under that tenant's prefix. Cross-tenant
-operations raise :class:`ValueError` and never reach the wire.
+storage key it is about to touch lives under that tenant's prefix.
+Cross-tenant operations raise :class:`ValueError` and never reach the wire
+(or the disk).
+
+Two backends are supported, chosen via ``settings.storage_backend``:
+
+* ``"local"`` (default): clips live under ``settings.storage_root`` and
+  playback is served by the in-process ``GET /clips/{id}/stream`` route.
+* ``"s3"``: clips live in MinIO/S3 and playback is a SigV4 presigned URL.
 
 Public surface:
-    * :func:`put_object` — upload bytes/file-like to ``s3://{bucket}/{key}``
-    * :func:`get_signed_url` — presigned GET URL with bounded TTL
-    * :func:`ensure_bucket` — create the configured bucket if missing
-    * :func:`build_clip_key` — canonical key layout helper
+    * :func:`put_object` — write clip bytes (disk or S3).
+    * :func:`get_playback_url` — return a URL the player can hit; either
+      ``"/clips/{id}/stream"`` (local) or a presigned S3 URL.
+    * :func:`get_signed_url` — presigned S3 GET URL with bounded TTL.
+      Only safe to call when ``storage_backend == "s3"``.
+    * :func:`ensure_bucket` — create the bucket or storage_root directory.
+    * :func:`build_clip_key` — canonical key layout helper.
 
-Boto3 is synchronous; we wrap every blocking call in
-:func:`anyio.to_thread.run_sync` so async FastAPI handlers don't stall the
-event loop.
+Boto3 is synchronous; we wrap blocking calls in
+:func:`anyio.to_thread.run_sync` so async FastAPI handlers don't stall.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
 from functools import lru_cache
+from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO
 from uuid import UUID
 
@@ -47,7 +57,7 @@ DEFAULT_SIGNED_URL_TTL_S: int = 3600
 
 
 # ---------------------------------------------------------------------------
-# Client factory
+# Client factory (s3 mode only)
 # ---------------------------------------------------------------------------
 
 
@@ -75,13 +85,12 @@ def get_s3_client() -> S3Client:
 
 
 def build_clip_key(tenant_id: UUID, started_at: datetime, clip_id: UUID) -> str:
-    """Return the canonical S3 key for a clip.
+    """Return the canonical storage key for a clip.
 
     Layout: ``{tenant_id}/{yyyy}/{mm}/{dd}/{clip_id}.mp4``. Date components
     come from ``started_at`` (the clip's start timestamp), in whatever
-    timezone the caller chose — typically UTC. We don't enforce a tz here
-    because the key is opaque to S3 and we want callers to pick their
-    bucket sharding strategy explicitly.
+    timezone the caller chose — typically UTC. The same layout is used
+    for both S3 keys and on-disk paths under ``storage_root``.
     """
     return (
         f"{tenant_id}/"
@@ -103,13 +112,21 @@ def _validate_tenant_prefix(tenant_id: UUID, key: str) -> None:
         raise ValueError("storage key does not belong to caller's tenant")
 
 
+def _storage_root() -> Path:
+    """Return ``settings.storage_root`` as a ``Path`` (accept ``str`` for env)."""
+    root = settings.storage_root
+    if not isinstance(root, Path):
+        root = Path(root)
+    return root
+
+
 # ---------------------------------------------------------------------------
-# Bucket lifecycle
+# Bucket / root lifecycle
 # ---------------------------------------------------------------------------
 
 
 def _ensure_bucket_sync() -> None:
-    """Create the configured bucket if it doesn't already exist."""
+    """Create the configured S3 bucket if it doesn't already exist."""
     client = get_s3_client()
     bucket = settings.s3_bucket
     try:
@@ -123,8 +140,20 @@ def _ensure_bucket_sync() -> None:
     client.create_bucket(Bucket=bucket)
 
 
+def _ensure_local_root_sync() -> None:
+    """Create the local storage root if it doesn't already exist."""
+    _storage_root().mkdir(parents=True, exist_ok=True)
+
+
 async def ensure_bucket() -> None:
-    """Ensure the configured bucket exists. Safe to call repeatedly."""
+    """Ensure the storage backend is ready to accept writes.
+
+    In ``local`` mode this creates ``storage_root``; in ``s3`` mode it
+    creates the configured bucket. Safe to call repeatedly.
+    """
+    if settings.storage_backend == "local":
+        await anyio.to_thread.run_sync(_ensure_local_root_sync)
+        return
     await anyio.to_thread.run_sync(_ensure_bucket_sync)
 
 
@@ -146,28 +175,50 @@ def _put_object_sync(key: str, body: Body, content_type: str) -> None:
     )
 
 
+def _put_object_local_sync(key: str, body: Body) -> None:
+    """Write ``body`` to ``storage_root/key``, creating parent dirs.
+
+    ``content_type`` is ignored on disk — the stream endpoint sets it
+    statically to ``video/mp4`` since clips are the only payload here.
+    """
+    target = _storage_root() / key
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(body, bytes):
+        target.write_bytes(body)
+    else:
+        # File-like: read in chunks to avoid loading huge files into memory.
+        with target.open("wb") as f:
+            while True:
+                chunk = body.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+
+
 async def put_object(
     tenant_id: UUID,
     key: str,
     body: Body,
     content_type: str = "video/mp4",
 ) -> None:
-    """Upload ``body`` to ``s3://{bucket}/{key}``.
+    """Write ``body`` under ``key``, scoped to ``tenant_id``.
 
     Args:
         tenant_id: Caller's tenant; ``key`` must live under this prefix.
-        key: Full object key. Use :func:`build_clip_key` to construct.
+        key: Full storage key. Use :func:`build_clip_key` to construct.
         body: Bytes or a binary file-like object.
-        content_type: MIME type stored as object metadata; defaults to
-            ``video/mp4`` since clips are the primary workload.
+        content_type: MIME type stored as object metadata (s3 mode only;
+            local mode infers from the file extension at read time).
 
     Raises:
         ValueError: If ``key`` is not under ``{tenant_id}/``.
-        botocore.exceptions.ClientError: On S3-side failures (network,
-            credentials, permissions). Callers should let these bubble up
-            to FastAPI's error handler unless they have a recovery path.
+        botocore.exceptions.ClientError: S3-side failures (s3 mode).
+        OSError: Disk failures (local mode).
     """
     _validate_tenant_prefix(tenant_id, key)
+    if settings.storage_backend == "local":
+        await anyio.to_thread.run_sync(_put_object_local_sync, key, body)
+        return
     await anyio.to_thread.run_sync(_put_object_sync, key, body, content_type)
 
 
@@ -186,7 +237,11 @@ async def get_signed_url(
     key: str,
     expires_s: int = DEFAULT_SIGNED_URL_TTL_S,
 ) -> str:
-    """Return a presigned GET URL for ``key``, valid for ``expires_s`` seconds.
+    """Return a presigned S3 GET URL for ``key``.
+
+    Only meaningful when ``settings.storage_backend == "s3"``. The router
+    no longer calls this directly; it goes through :func:`get_playback_url`
+    which delegates here in s3 mode.
 
     Args:
         tenant_id: Caller's tenant; ``key`` must live under this prefix.
@@ -205,3 +260,39 @@ async def get_signed_url(
         )
     _validate_tenant_prefix(tenant_id, key)
     return await anyio.to_thread.run_sync(_get_signed_url_sync, key, expires_s)
+
+
+async def get_playback_url(
+    *,
+    tenant_id: UUID,
+    key: str,
+    clip_id: UUID,
+    expires_s: int = DEFAULT_SIGNED_URL_TTL_S,
+) -> str:
+    """Return a URL the player can use to fetch ``clip_id``'s bytes.
+
+    Mode dispatch:
+
+    * ``local`` → ``"/clips/{clip_id}/stream"`` — a relative route on the
+      backend that serves the file with HTTP Range support. The frontend
+      is responsible for prefixing the API base when it sets ``<video src>``.
+    * ``s3`` → a SigV4 presigned GET URL via :func:`get_signed_url`.
+
+    The tenant-prefix check still runs in both branches, so a router that
+    accidentally passed a cross-tenant key would be refused before the URL
+    is constructed.
+
+    Args:
+        tenant_id: Caller's tenant; ``key`` must live under this prefix.
+        key: Canonical storage key (see :func:`build_clip_key`).
+        clip_id: Clip UUID — used only in local mode to build the route.
+        expires_s: TTL forwarded to :func:`get_signed_url` in s3 mode.
+
+    Raises:
+        ValueError: If ``key`` is not under the caller's tenant prefix
+            (or ``expires_s`` is out of range in s3 mode).
+    """
+    _validate_tenant_prefix(tenant_id, key)
+    if settings.storage_backend == "local":
+        return f"/clips/{clip_id}/stream"
+    return await get_signed_url(tenant_id, key, expires_s=expires_s)

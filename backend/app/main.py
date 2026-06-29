@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.routers import audit, clips, me
+from app.routers import audit, clips, events, me
 
 app = FastAPI(title="Dashcam Portal API", version="0.1.0")
 
@@ -16,6 +16,7 @@ app.add_middleware(
 app.include_router(me.router)
 app.include_router(audit.router)
 app.include_router(clips.router)
+app.include_router(events.router)
 
 
 @app.get("/healthz")

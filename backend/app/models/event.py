@@ -5,13 +5,16 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import DateTime, Enum, Float, ForeignKey, Index
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
+
+if TYPE_CHECKING:
+    from app.models.truck import Truck
 
 
 class EventType(StrEnum):
@@ -86,3 +89,8 @@ class Event(Base):
     )
     gps_lat: Mapped[float | None] = mapped_column(Float, nullable=True)
     gps_lng: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # ORM-only relationship — no migration impact. Used by the /events
+    # endpoints so we can eager-load via ``selectinload`` and flatten
+    # ``truck.label`` onto the response row.
+    truck: Mapped[Truck] = relationship(lazy="raise")

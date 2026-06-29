@@ -1,10 +1,19 @@
-import "./App.css";
+import { QueryClientProvider } from "@tanstack/react-query";
+import { RouterProvider } from "react-router-dom";
+
+import { router } from "@/app/router";
+import { DevUserPicker } from "@/components/DevUserPicker";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
+import { queryClient } from "@/lib/queryClient";
 
 function App() {
   return (
-    <main className="min-h-screen flex items-center justify-center">
-      <p className="text-sm text-gray-500">Dashcam Portal</p>
-    </main>
+    <QueryClientProvider client={queryClient}>
+      <ErrorBoundary>
+        <RouterProvider router={router} />
+        <DevUserPicker />
+      </ErrorBoundary>
+    </QueryClientProvider>
   );
 }
 

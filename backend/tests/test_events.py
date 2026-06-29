@@ -34,6 +34,7 @@ from app.main import app
 from app.models.audit import AuditLog
 from app.models.case import Case
 from app.models.clip import Clip
+from app.models.driver import Driver
 from app.models.event import Event, EventSeverity, EventType
 from app.models.tenant import Tenant
 from app.models.truck import Truck
@@ -171,12 +172,25 @@ async def _seed_truck(
     return truck
 
 
+async def _seed_driver(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    name: str,
+) -> Driver:
+    driver = Driver(id=uuid.uuid4(), tenant_id=tenant_id, name=name)
+    session.add(driver)
+    await session.flush()
+    return driver
+
+
 async def _seed_clip(
     session: AsyncSession,
     *,
     tenant_id: uuid.UUID,
     truck_id: uuid.UUID,
     started_at: datetime,
+    driver_id: uuid.UUID | None = None,
 ) -> Clip:
     """Minimal clip row used by the ``clip_id`` filter test.
 
@@ -189,7 +203,7 @@ async def _seed_clip(
         id=clip_id,
         tenant_id=tenant_id,
         truck_id=truck_id,
-        driver_id=None,
+        driver_id=driver_id,
         started_at=started_at,
         ended_at=started_at + timedelta(seconds=30),
         duration_s=30,
@@ -604,6 +618,152 @@ async def test_list_events_filter_by_clip_id(
     assert ids == {e_match_1.id, e_match_2.id}
     assert e_other.id not in ids
     assert e_unlinked.id not in ids
+
+
+@pytest.mark.asyncio
+async def test_list_events_filter_by_driver_id(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+) -> None:
+    """``?driver_id=`` must filter via the event's attached clip.
+
+    Events have no direct driver FK; driver attribution lives on the
+    clip. T13 plumbs this filter via an inner-join on ``clips.driver_id``
+    so the ``/drivers/:id/events`` page can scope events to one driver.
+
+    Events whose ``clip_id`` is null are excluded by construction —
+    they can't be attributed to a driver. Cross-tenant clips are
+    excluded by the outer tenant scope plus the explicit tenant match
+    on the clip join.
+    """
+    client, s = http_client_with_session
+
+    tenant = uuid.uuid4()
+    await _seed_tenant(s, tenant)
+    truck = await _seed_truck(s, tenant_id=tenant, label="T-drv")
+    driver_a = await _seed_driver(s, tenant_id=tenant, name="Alice")
+    driver_b = await _seed_driver(s, tenant_id=tenant, name="Bob")
+
+    base = datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC)
+    clip_alice = await _seed_clip(
+        s,
+        tenant_id=tenant,
+        truck_id=truck.id,
+        started_at=base,
+        driver_id=driver_a.id,
+    )
+    clip_bob = await _seed_clip(
+        s,
+        tenant_id=tenant,
+        truck_id=truck.id,
+        started_at=base,
+        driver_id=driver_b.id,
+    )
+    clip_unassigned = await _seed_clip(
+        s,
+        tenant_id=tenant,
+        truck_id=truck.id,
+        started_at=base,
+        driver_id=None,
+    )
+
+    e_alice_1 = await _seed_event(
+        s,
+        tenant_id=tenant,
+        truck_id=truck.id,
+        occurred_at=base,
+        clip_id=clip_alice.id,
+    )
+    e_alice_2 = await _seed_event(
+        s,
+        tenant_id=tenant,
+        truck_id=truck.id,
+        occurred_at=base + timedelta(minutes=1),
+        clip_id=clip_alice.id,
+    )
+    e_bob = await _seed_event(
+        s,
+        tenant_id=tenant,
+        truck_id=truck.id,
+        occurred_at=base + timedelta(minutes=2),
+        clip_id=clip_bob.id,
+    )
+    e_unassigned = await _seed_event(
+        s,
+        tenant_id=tenant,
+        truck_id=truck.id,
+        occurred_at=base + timedelta(minutes=3),
+        clip_id=clip_unassigned.id,
+    )
+    e_no_clip = await _seed_event(
+        s,
+        tenant_id=tenant,
+        truck_id=truck.id,
+        occurred_at=base + timedelta(minutes=4),
+        clip_id=None,
+    )
+
+    principal = _principal(tenant_id=tenant)
+    resp = await client.get(
+        "/events",
+        params={"driver_id": str(driver_a.id)},
+        headers=_dev_headers(principal),
+    )
+    assert resp.status_code == 200, resp.text
+    body = EventListResponse.model_validate(resp.json())
+    ids = {row.id for row in body.items}
+    assert ids == {e_alice_1.id, e_alice_2.id}
+    assert e_bob.id not in ids
+    assert e_unassigned.id not in ids
+    assert e_no_clip.id not in ids
+
+
+@pytest.mark.asyncio
+async def test_list_events_filter_by_driver_id_tenant_scoped(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+) -> None:
+    """A driver id from another tenant must yield zero events.
+
+    Defence-in-depth: even if a caller could enumerate driver IDs from
+    another tenant, the events query is tenant-scoped on both the
+    ``events`` and the joined ``clips`` rows, so the result set is empty.
+    """
+    client, s = http_client_with_session
+
+    tenant_a = uuid.uuid4()
+    tenant_b = uuid.uuid4()
+    await _seed_tenant(s, tenant_a)
+    await _seed_tenant(s, tenant_b)
+
+    truck_a = await _seed_truck(s, tenant_id=tenant_a, label="A-1")
+    driver_a = await _seed_driver(s, tenant_id=tenant_a, name="Alice")
+
+    base = datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC)
+    clip_a = await _seed_clip(
+        s,
+        tenant_id=tenant_a,
+        truck_id=truck_a.id,
+        started_at=base,
+        driver_id=driver_a.id,
+    )
+    await _seed_event(
+        s,
+        tenant_id=tenant_a,
+        truck_id=truck_a.id,
+        occurred_at=base,
+        clip_id=clip_a.id,
+    )
+
+    principal_b = _principal(tenant_id=tenant_b)
+    resp = await client.get(
+        "/events",
+        params={"driver_id": str(driver_a.id)},
+        headers=_dev_headers(principal_b),
+    )
+    assert resp.status_code == 200, resp.text
+    body = EventListResponse.model_validate(resp.json())
+    assert body.items == []
 
 
 @pytest.mark.asyncio

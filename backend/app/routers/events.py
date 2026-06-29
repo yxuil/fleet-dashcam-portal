@@ -2,9 +2,13 @@
 
 Filtering on the list endpoints
 -------------------------------
-* ``truck_id`` / ``driver_id`` — optional exact-match filters. ``driver_id``
-  is accepted for API symmetry with ``/clips`` but currently has no effect
-  on the event row itself (events have no direct driver FK in T7).
+* ``truck_id`` — optional exact-match filter on the event's ``truck_id``.
+* ``driver_id`` — optional filter on the event's *clip*'s ``driver_id``.
+  Events don't carry a direct driver FK; driver attribution lives on the
+  clip the event belongs to. T13 enables this filter so the
+  ``/drivers/:id/events`` frontend route can be implemented. When the
+  filter is active, the query joins ``clips`` and matches
+  ``Clip.driver_id``; events whose ``clip_id`` is null are excluded.
 * ``clip_id`` — optional exact-match on the event's nullable ``clip_id`` FK.
   Used by T12 to render harsh-event markers on the clip timeline.
 * ``from`` / ``to`` — ISO 8601 timestamps, inclusive of ``occurred_at``.
@@ -45,6 +49,7 @@ from sqlalchemy.orm import selectinload
 from app.audit import record as audit_record
 from app.auth import Principal, current_user
 from app.db import get_session
+from app.models.clip import Clip
 from app.models.event import Event, EventSeverity, EventType
 from app.models.truck import Truck
 from app.schemas.event import EventListResponse, EventRow, TriageRequest
@@ -96,6 +101,7 @@ def _apply_event_filters(
     stmt: Select[tuple[Event]],
     *,
     truck_id: UUID | None,
+    driver_id: UUID | None,
     clip_id: UUID | None,
     from_: datetime | None,
     to: datetime | None,
@@ -107,9 +113,23 @@ def _apply_event_filters(
     Multi-valued ``severity`` and ``type_`` are interpreted as set
     membership — an event matches if its column value appears in the list.
     Empty lists mean "no filter on this dimension".
+
+    ``driver_id`` is special: events don't carry a direct driver FK, so we
+    join ``clips`` on ``Event.clip_id`` and filter on ``Clip.driver_id``.
+    Events without an attached clip are excluded — they can't be attributed
+    to a driver. Tenant scoping on the outer query still applies, but we
+    additionally require ``Clip.tenant_id`` to match so a stray cross-tenant
+    clip FK (shouldn't happen, but defence-in-depth) can't leak through.
     """
     if truck_id is not None:
         stmt = stmt.where(Event.truck_id == truck_id)
+    if driver_id is not None:
+        # INNER join (default) on clips: any event without a clip can't
+        # be attributed to a driver and is excluded by construction.
+        stmt = stmt.join(Clip, Clip.id == Event.clip_id).where(
+            Clip.driver_id == driver_id,
+            Clip.tenant_id == Event.tenant_id,
+        )
     if clip_id is not None:
         stmt = stmt.where(Event.clip_id == clip_id)
     if from_ is not None:
@@ -128,6 +148,7 @@ async def _query_events_page(
     *,
     tenant_id: UUID,
     truck_id: UUID | None,
+    driver_id: UUID | None,
     clip_id: UUID | None,
     from_: datetime | None,
     to: datetime | None,
@@ -153,6 +174,7 @@ async def _query_events_page(
     stmt = _apply_event_filters(
         stmt,
         truck_id=truck_id,
+        driver_id=driver_id,
         clip_id=clip_id,
         from_=from_,
         to=to,
@@ -210,7 +232,7 @@ async def list_events(
     principal: Annotated[Principal, Depends(current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
     truck_id: Annotated[UUID | None, Query()] = None,
-    driver_id: Annotated[UUID | None, Query()] = None,  # noqa: ARG001 — see docstring
+    driver_id: Annotated[UUID | None, Query()] = None,
     clip_id: Annotated[UUID | None, Query()] = None,
     from_: Annotated[datetime | None, Query(alias="from")] = None,
     to: Annotated[datetime | None, Query()] = None,
@@ -221,11 +243,11 @@ async def list_events(
 ) -> EventListResponse:
     """Return a page of events for the caller's tenant.
 
-    ``driver_id`` is accepted in the query signature for API symmetry with
-    ``/clips`` but is intentionally a no-op in T7: events don't carry a
-    direct driver FK, so there's nothing to filter on yet. Documenting it
-    in the signature still lets the OpenAPI schema and frontend planning
-    proceed without churn.
+    ``driver_id`` filters via the event's attached clip. Events don't
+    carry a direct driver FK; instead the filter joins ``clips`` on
+    ``Event.clip_id`` and matches ``Clip.driver_id``. Events whose
+    ``clip_id`` is null are excluded — they can't be attributed to a
+    driver. Used by T13's ``/drivers/:id/events`` route.
 
     ``clip_id`` restricts results to events whose nullable ``clip_id`` FK
     matches. Used by T12's video-player page to render harsh-event markers
@@ -236,6 +258,7 @@ async def list_events(
         session,
         tenant_id=principal.tenant_id,
         truck_id=truck_id,
+        driver_id=driver_id,
         clip_id=clip_id,
         from_=from_,
         to=to,
@@ -280,6 +303,7 @@ async def list_truck_events(
         session,
         tenant_id=principal.tenant_id,
         truck_id=truck_id,
+        driver_id=None,
         clip_id=None,
         from_=from_,
         to=to,

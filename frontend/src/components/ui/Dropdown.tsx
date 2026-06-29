@@ -77,6 +77,8 @@ export type DropdownItemProps = {
   children: ReactNode;
   disabled?: boolean;
   className?: string;
+  /** Forwarded to the underlying `<button>` for test selectors. */
+  "data-testid"?: string;
 };
 
 export function DropdownItem({
@@ -84,12 +86,14 @@ export function DropdownItem({
   children,
   disabled,
   className,
+  "data-testid": testId,
 }: DropdownItemProps) {
   return (
     <button
       type="button"
       role="menuitem"
       disabled={disabled}
+      data-testid={testId}
       onClick={(e) => {
         e.stopPropagation();
         if (!disabled) onSelect?.();

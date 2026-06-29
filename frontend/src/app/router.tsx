@@ -12,9 +12,10 @@ import { createBrowserRouter, Navigate } from "react-router-dom";
 import { Layout } from "@/components/Layout";
 import { CaseDetailPage, CasesPage } from "@/pages/CasesPage";
 import { ClipPage } from "@/pages/ClipPage";
+import { EventTimelinePage } from "@/pages/EventTimelinePage";
 import { NotFoundPage } from "@/pages/NotFoundPage";
 import { SearchPage } from "@/pages/SearchPage";
-import { TruckEventsPage, TrucksPage } from "@/pages/TrucksPage";
+import { TrucksPage } from "@/pages/TrucksPage";
 
 export const router = createBrowserRouter([
   {
@@ -24,7 +25,14 @@ export const router = createBrowserRouter([
       { index: true, element: <Navigate to="/search" replace /> },
       { path: "search", element: <SearchPage /> },
       { path: "trucks", element: <TrucksPage /> },
-      { path: "trucks/:id/events", element: <TruckEventsPage /> },
+      {
+        path: "trucks/:id/events",
+        element: <EventTimelinePage scope="truck" />,
+      },
+      {
+        path: "drivers/:id/events",
+        element: <EventTimelinePage scope="driver" />,
+      },
       { path: "clips/:id", element: <ClipPage /> },
       { path: "cases", element: <CasesPage /> },
       { path: "cases/:id", element: <CaseDetailPage /> },

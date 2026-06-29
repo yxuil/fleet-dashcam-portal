@@ -42,13 +42,12 @@ npm run dev
 | MinIO API   | http://localhost:9000                      | `minioadmin` / `minioadmin` |
 | MinIO UI    | http://localhost:9001                      | `minioadmin` / `minioadmin` |
 
-The `minio-init` container creates the `dashcam-clips` bucket on first run. If it
-was skipped, create it manually:
+The `minio-init` service runs automatically as part of `docker compose up -d` and
+creates the `dashcam-clips` bucket. If you need to (re)run it manually (works on
+macOS / Windows / Linux because it uses the compose network):
 
 ```bash
-docker run --rm --network host minio/mc:latest \
-  sh -c "mc alias set local http://localhost:9000 minioadmin minioadmin && \
-         mc mb --ignore-existing local/dashcam-clips"
+docker compose -f infra/docker-compose.dev.yml run --rm minio-init
 ```
 
 ## Tests

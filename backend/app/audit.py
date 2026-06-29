@@ -78,6 +78,46 @@ async def record(
     await session.flush()
 
 
+async def record_system(
+    session: AsyncSession,
+    *,
+    tenant_id: UUID,
+    action: str,
+    target_type: str,
+    target_id: UUID | None = None,
+    payload: dict[str, Any] | None = None,
+) -> None:
+    """Append one audit row for a *system* (non-principal) action.
+
+    Sibling of :func:`record` for callers that don't have an authenticated
+    :class:`~app.auth.Principal` — e.g. the forward-compat ingest stub
+    that's invoked by an upstream service rather than a logged-in user.
+    ``actor_user_id`` is set to ``None`` to make the system origin explicit.
+
+    Like :func:`record`, this does **not** commit. The calling router
+    owns the transaction boundary.
+
+    Args:
+        session: Active async SQLAlchemy session.
+        tenant_id: Owning tenant for the audited action.
+        action: Short verb such as ``"clip.ingested"``.
+        target_type: The kind of entity acted upon (``"clip"``…).
+        target_id: Optional UUID of the specific entity.
+        payload: Arbitrary JSON-serializable detail. ``None`` is coerced
+            to ``{}`` so the column never holds SQL ``NULL``.
+    """
+    row = AuditLog(
+        tenant_id=tenant_id,
+        actor_user_id=None,
+        action=action,
+        target_type=target_type,
+        target_id=target_id,
+        payload=payload if payload is not None else {},
+    )
+    session.add(row)
+    await session.flush()
+
+
 # ---------------------------------------------------------------------------
 # Response models
 # ---------------------------------------------------------------------------

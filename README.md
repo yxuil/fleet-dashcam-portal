@@ -62,6 +62,23 @@ uv run alembic downgrade base    # roll everything back
 uv run alembic revision --autogenerate -m "<msg>"   # new migration
 ```
 
+## Seed dev data
+
+Populate the database with two tenants, trucks, drivers, ~200 clips, and
+~80 events so the frontend has something to render:
+
+```bash
+docker compose -f infra/docker-compose.dev.yml up -d
+cd backend && uv run alembic upgrade head
+uv run python -m app.seed --reset                 # truncate + reseed
+uv run python -m app.seed --reset --no-upload-samples   # skip MinIO uploads
+```
+
+`--reset` truncates every app table in FK-safe order before reseeding.
+Tenant IDs are derived via `uuid5` so they're stable across runs — handy
+when sharing URLs with frontend devs. Drop MP4 files in `samples/` to
+get real, playable bytes attached to seeded clips (see `samples/README.md`).
+
 ## Tests
 
 ```bash

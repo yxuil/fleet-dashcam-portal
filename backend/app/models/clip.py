@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, func
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
+
+if TYPE_CHECKING:
+    from app.models.driver import Driver
+    from app.models.truck import Truck
 
 
 class Clip(Base):
@@ -54,3 +59,9 @@ class Clip(Base):
         server_default=func.now(),
         nullable=False,
     )
+
+    # ORM-only relationships — no migration impact. Used by /clips endpoints
+    # so we can eager-load via selectinload and run text filters that ILIKE
+    # truck.label OR driver.name without N+1.
+    truck: Mapped[Truck] = relationship(back_populates="clips", lazy="raise")
+    driver: Mapped[Driver | None] = relationship(back_populates="clips", lazy="raise")

@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy import DateTime, ForeignKey, Index, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
+
+if TYPE_CHECKING:
+    from app.models.clip import Clip
 
 
 class Truck(Base):
@@ -36,3 +40,6 @@ class Truck(Base):
         DateTime(timezone=True),
         nullable=True,
     )
+
+    # ORM-only back-ref for clip listing endpoints.
+    clips: Mapped[list[Clip]] = relationship(back_populates="truck", lazy="raise")

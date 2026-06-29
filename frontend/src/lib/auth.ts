@@ -55,7 +55,10 @@ export type DevUser = {
 //     [print(s, uuid.uuid5(D, f'{s}.dashcam'), \
 //                  uuid.uuid5(D, f'{s}.user.admin'), \
 //                  uuid.uuid5(D, f'{s}.user.viewer')) \
-//      for s in ('acme','northwind')]"
+//      for s in ('acme',)]"
+//
+// The demo seed currently uses a single tenant (Acme). When adding more
+// tenants in seed.py, extend DEV_USERS in lockstep.
 // ---------------------------------------------------------------------------
 
 export const DEV_USERS: readonly DevUser[] = [
@@ -76,24 +79,6 @@ export const DEV_USERS: readonly DevUser[] = [
     tenant_name: "Acme Logistics",
     email: "viewer@acme.dev",
     display_name: "Acme Logistics Viewer",
-  },
-  {
-    id: "northwind-admin",
-    label: "Northwind — Admin",
-    user_id: "35a98177-6209-56fd-b029-d13da11a5ffc",
-    tenant_id: "9b8edf70-4582-586b-9627-768850412a8b",
-    tenant_name: "Northwind Freight",
-    email: "admin@northwind.dev",
-    display_name: "Northwind Freight Admin",
-  },
-  {
-    id: "northwind-viewer",
-    label: "Northwind — Viewer",
-    user_id: "975afacf-7996-5fae-a59f-6525bfa1b47b",
-    tenant_id: "9b8edf70-4582-586b-9627-768850412a8b",
-    tenant_name: "Northwind Freight",
-    email: "viewer@northwind.dev",
-    display_name: "Northwind Freight Viewer",
   },
 ] as const;
 

@@ -101,37 +101,50 @@ async def session() -> AsyncIterator[AsyncSession]:
 
 
 @pytest.mark.asyncio
-async def test_seed_creates_two_tenants_with_expected_counts(
+async def test_seed_creates_expected_counts(
     session: AsyncSession,
 ) -> None:
     """One seed run produces the documented number of rows per table.
 
-    Counts:
-      tenants = 2
-      users   = 4   (2 per tenant: admin + viewer)
-      trucks  = 6   (3 per tenant)
-      drivers = 8   (4 per tenant)
-      clips   = TOTAL_CLIPS  (split evenly across tenants)
+    Counts (1-tenant demo seed):
+      tenants = 1   (Acme)
+      users   = 2   (admin + viewer)
+      trucks  = 2
+      drivers = 2
+      clips   = TOTAL_CLIPS
       events  = TOTAL_EVENTS
 
     Also asserts tenant-isolation invariants: every row's tenant_id is
-    one of the two seeded tenants, and trucks for tenant A only appear
-    on tenant-A clips/events.
+    the seeded tenant, and trucks owning the clip/event match the
+    clip/event's tenant_id.
     """
     summary = await run_seed(reset=True, upload_samples=False)
 
-    assert summary.tenants == 2
-    assert summary.users == 4
-    assert summary.trucks == 6
-    assert summary.drivers == 8
+    expected_tenants = len(TENANT_SPECS)
+    expected_users = expected_tenants * 2
+    expected_trucks = sum(len(s.truck_labels) for s in TENANT_SPECS)
+    expected_drivers = sum(len(s.driver_names) for s in TENANT_SPECS)
+
+    assert summary.tenants == expected_tenants
+    assert summary.users == expected_users
+    assert summary.trucks == expected_trucks
+    assert summary.drivers == expected_drivers
     assert summary.clips == TOTAL_CLIPS
     assert summary.events == TOTAL_EVENTS
 
     # Verify via the DB, not just the in-memory summary.
-    assert (await session.execute(select(func.count()).select_from(Tenant))).scalar_one() == 2
-    assert (await session.execute(select(func.count()).select_from(User))).scalar_one() == 4
-    assert (await session.execute(select(func.count()).select_from(Truck))).scalar_one() == 6
-    assert (await session.execute(select(func.count()).select_from(Driver))).scalar_one() == 8
+    assert (
+        await session.execute(select(func.count()).select_from(Tenant))
+    ).scalar_one() == expected_tenants
+    assert (
+        await session.execute(select(func.count()).select_from(User))
+    ).scalar_one() == expected_users
+    assert (
+        await session.execute(select(func.count()).select_from(Truck))
+    ).scalar_one() == expected_trucks
+    assert (
+        await session.execute(select(func.count()).select_from(Driver))
+    ).scalar_one() == expected_drivers
     assert (
         await session.execute(select(func.count()).select_from(Clip))
     ).scalar_one() == TOTAL_CLIPS

@@ -7,14 +7,13 @@ Usage::
 
 What it does
 ------------
-* Creates two tenants (``Acme Logistics`` and ``Northwind Freight``) with
-  deterministic ``uuid5`` ids so the frontend can hardcode them during dev.
-* For each tenant: 1 admin user, 1 viewer user, 3 trucks, 4 drivers.
-* ~200 clips total spread randomly over the last 30 days. Each clip
-  references one of the sample MP4s round-robin (or a synthetic key if
-  ``samples/`` is empty).
-* ~80 events with a mix of types and severities, each anchored to a real
-  clip on the same truck.
+* Creates one tenant (``Acme Logistics``) with a deterministic ``uuid5``
+  id so the frontend can hardcode it during dev.
+* 1 admin user + 1 viewer user, 2 trucks, 2 drivers.
+* 7 clips spread over the last ~10 days — one per sample MP4 in
+  ``samples/`` so the demo has 1:1 backing video files. Trucks rotate
+  round-robin (4 + 3) and drivers are picked at random.
+* A handful of events anchored to those clips.
 
 No cases are seeded — keep MVP seed simple. Frontend (T13) creates them.
 
@@ -118,25 +117,20 @@ TENANT_SPECS: tuple[TenantSpec, ...] = (
     TenantSpec(
         slug="acme",
         name="Acme Logistics",
-        truck_labels=("Truck 101", "Truck 102", "Truck 103"),
-        driver_names=("Alex Chen", "Brianna Davis", "Carlos Ortiz", "Dana Patel"),
-    ),
-    TenantSpec(
-        slug="northwind",
-        name="Northwind Freight",
-        truck_labels=("Truck 201", "Truck 202", "Truck 203"),
-        driver_names=("Erin Murphy", "Felix Tanaka", "Gwen Russo", "Henry Park"),
+        truck_labels=("Truck 101", "Truck 102"),
+        driver_names=("Alex Chen", "Brianna Davis"),
     ),
 )
 
-#: Total clip count to spread across both tenants (approximately).
-TOTAL_CLIPS: int = 200
+#: Total clip count to seed. Sized to match the 7 sample MP4s so each
+#: clip has its own backing file (no shared symlinks).
+TOTAL_CLIPS: int = 7
 
-#: Total event count to spread across both tenants (approximately).
-TOTAL_EVENTS: int = 80
+#: Total event count to spread across the seeded clips.
+TOTAL_EVENTS: int = 6
 
 #: How many days into the past to spread clips/events over.
-WINDOW_DAYS: int = 30
+WINDOW_DAYS: int = 10
 
 
 @dataclass
@@ -426,6 +420,31 @@ def _upload_samples_sync(
     return uploaded
 
 
+def _clear_local_storage_sync(storage_root: Path) -> None:
+    """Remove the contents of ``storage_root`` (used on ``--reset``).
+
+    Wipes symlinks and any directory tree we previously laid down so a
+    re-seed doesn't leave orphaned files from earlier runs. Bounded to
+    the configured ``storage_root`` only — never touches the wider FS.
+    """
+    import shutil
+
+    root = storage_root.resolve()
+    if not root.exists():
+        return
+    # Iterate top-level entries and remove each. shutil.rmtree handles
+    # nested dirs + symlinks safely (it doesn't follow symlinks into
+    # samples/).
+    for child in root.iterdir():
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child, ignore_errors=True)
+        else:
+            try:
+                child.unlink()
+            except OSError:
+                logger.exception("failed to remove %s during reset", child)
+
+
 def _link_samples_sync(
     clips: Iterable[Clip],
     sample_mp4s: list[Path],
@@ -568,6 +587,11 @@ async def run_seed(
                 # Resolve storage_root once; the symlinker also resolves but
                 # passing it through keeps the test wiring obvious.
                 root = Path(settings.storage_root)
+                if reset:
+                    # Clear stale symlinks from previous seed runs so the
+                    # tree matches the freshly seeded clip rows exactly.
+                    # Bounded to the configured storage_root.
+                    await asyncio.to_thread(_clear_local_storage_sync, root)
                 summary.links = await asyncio.to_thread(
                     _link_samples_sync, all_clips, sample_mp4s, root
                 )

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import AsyncIterator, Iterator
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
@@ -27,6 +28,8 @@ from app.auth import Principal
 from app.config import settings
 from app.db import get_session
 from app.main import app
+from app.models.clip import Clip
+from app.models.driver import Driver
 from app.models.tenant import Tenant
 from app.models.truck import Truck
 
@@ -164,6 +167,43 @@ async def _seed_truck(
     return truck
 
 
+async def _seed_driver(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    name: str,
+) -> Driver:
+    driver = Driver(id=uuid.uuid4(), tenant_id=tenant_id, name=name)
+    session.add(driver)
+    await session.flush()
+    return driver
+
+
+async def _seed_clip(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    truck_id: uuid.UUID,
+    started_at: datetime,
+    duration_s: int = 60,
+    driver_id: uuid.UUID | None = None,
+) -> Clip:
+    ended_at = started_at + timedelta(seconds=duration_s)
+    clip = Clip(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        truck_id=truck_id,
+        driver_id=driver_id,
+        started_at=started_at,
+        ended_at=ended_at,
+        duration_s=duration_s,
+        storage_key=f"{tenant_id}/{started_at.date()}/{uuid.uuid4()}.mp4",
+    )
+    session.add(clip)
+    await session.flush()
+    return clip
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -268,3 +308,210 @@ async def test_get_truck_cross_tenant_returns_404(
         f"/trucks/{truck_b.id}", headers=_dev_headers(principal_a)
     )
     assert resp.status_code == 404, resp.text
+
+
+# ---------------------------------------------------------------------------
+# /trucks/{id}/days
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_days_endpoint_returns_descending_dates(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+) -> None:
+    """5 clips across 3 days produce 3 rows, newest day first."""
+    client, s = http_client_with_session
+
+    tenant = uuid.uuid4()
+    await _seed_tenant(s, tenant)
+    truck = await _seed_truck(s, tenant_id=tenant, label="T-1")
+
+    base = datetime(2026, 6, 27, 9, 0, tzinfo=UTC)
+    # Day 1 (oldest): 2 clips.
+    await _seed_clip(s, tenant_id=tenant, truck_id=truck.id, started_at=base, duration_s=30)
+    await _seed_clip(
+        s, tenant_id=tenant, truck_id=truck.id, started_at=base + timedelta(hours=1), duration_s=45
+    )
+    # Day 2: 1 clip.
+    await _seed_clip(
+        s, tenant_id=tenant, truck_id=truck.id, started_at=base + timedelta(days=1), duration_s=120
+    )
+    # Day 3 (newest): 2 clips.
+    await _seed_clip(
+        s, tenant_id=tenant, truck_id=truck.id, started_at=base + timedelta(days=2), duration_s=60
+    )
+    await _seed_clip(
+        s,
+        tenant_id=tenant,
+        truck_id=truck.id,
+        started_at=base + timedelta(days=2, hours=2),
+        duration_s=90,
+    )
+
+    principal = _principal(tenant_id=tenant)
+    resp = await client.get(
+        f"/trucks/{truck.id}/days", headers=_dev_headers(principal)
+    )
+    assert resp.status_code == 200, resp.text
+    rows = resp.json()
+    assert len(rows) == 3
+    dates = [r["date"] for r in rows]
+    assert dates == sorted(dates, reverse=True)
+    # Newest day has 2 clips and 150s total.
+    assert rows[0]["clip_count"] == 2
+    assert rows[0]["total_duration_s"] == 150
+    # Middle day: 1 clip, 120s.
+    assert rows[1]["clip_count"] == 1
+    assert rows[1]["total_duration_s"] == 120
+    # Oldest day: 2 clips, 75s.
+    assert rows[2]["clip_count"] == 2
+    assert rows[2]["total_duration_s"] == 75
+
+
+@pytest.mark.asyncio
+async def test_days_endpoint_filters_by_driver(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+) -> None:
+    """``?driver_id=`` narrows the rollup to one driver's clips."""
+    client, s = http_client_with_session
+
+    tenant = uuid.uuid4()
+    await _seed_tenant(s, tenant)
+    truck = await _seed_truck(s, tenant_id=tenant, label="T-1")
+    alice = await _seed_driver(s, tenant_id=tenant, name="Alice")
+    bob = await _seed_driver(s, tenant_id=tenant, name="Bob")
+
+    base = datetime(2026, 6, 27, 9, 0, tzinfo=UTC)
+    # Same day, two drivers.
+    await _seed_clip(
+        s, tenant_id=tenant, truck_id=truck.id, started_at=base, duration_s=30, driver_id=alice.id
+    )
+    await _seed_clip(
+        s,
+        tenant_id=tenant,
+        truck_id=truck.id,
+        started_at=base + timedelta(hours=1),
+        duration_s=45,
+        driver_id=alice.id,
+    )
+    await _seed_clip(
+        s,
+        tenant_id=tenant,
+        truck_id=truck.id,
+        started_at=base + timedelta(hours=2),
+        duration_s=60,
+        driver_id=bob.id,
+    )
+
+    principal = _principal(tenant_id=tenant)
+    resp = await client.get(
+        f"/trucks/{truck.id}/days?driver_id={alice.id}",
+        headers=_dev_headers(principal),
+    )
+    assert resp.status_code == 200, resp.text
+    rows = resp.json()
+    assert len(rows) == 1
+    assert rows[0]["clip_count"] == 2
+    assert rows[0]["total_duration_s"] == 75
+
+
+@pytest.mark.asyncio
+async def test_days_endpoint_filters_by_date_range(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+) -> None:
+    """``?from=`` and ``?to=`` restrict the window of clips considered."""
+    client, s = http_client_with_session
+
+    tenant = uuid.uuid4()
+    await _seed_tenant(s, tenant)
+    truck = await _seed_truck(s, tenant_id=tenant, label="T-1")
+
+    base = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+    for delta_days in (0, 5, 10):
+        await _seed_clip(
+            s,
+            tenant_id=tenant,
+            truck_id=truck.id,
+            started_at=base + timedelta(days=delta_days),
+            duration_s=60,
+        )
+
+    principal = _principal(tenant_id=tenant)
+    # Window includes only the middle clip. Pass via ``params=`` so httpx
+    # URL-encodes the ``+`` in the timezone offset instead of letting the
+    # raw ``+`` be interpreted as a space by the server.
+    resp = await client.get(
+        f"/trucks/{truck.id}/days",
+        headers=_dev_headers(principal),
+        params={
+            "from": (base + timedelta(days=3)).isoformat(),
+            "to": (base + timedelta(days=7)).isoformat(),
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    rows = resp.json()
+    assert len(rows) == 1
+    assert rows[0]["clip_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_days_endpoint_cross_tenant_returns_404(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+) -> None:
+    """A truck owned by another tenant returns 404 with detail ``"not found"``."""
+    client, s = http_client_with_session
+
+    tenant_a = uuid.uuid4()
+    tenant_b = uuid.uuid4()
+    await _seed_tenant(s, tenant_a)
+    await _seed_tenant(s, tenant_b)
+    truck_b = await _seed_truck(s, tenant_id=tenant_b, label="B-1")
+
+    principal_a = _principal(tenant_id=tenant_a)
+    resp = await client.get(
+        f"/trucks/{truck_b.id}/days", headers=_dev_headers(principal_a)
+    )
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["detail"] == "not found"
+
+
+@pytest.mark.asyncio
+async def test_days_endpoint_unknown_truck_returns_404(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+) -> None:
+    """A nonexistent truck id 404s the same way a cross-tenant one does."""
+    client, s = http_client_with_session
+
+    tenant = uuid.uuid4()
+    await _seed_tenant(s, tenant)
+    principal = _principal(tenant_id=tenant)
+
+    resp = await client.get(
+        f"/trucks/{uuid.uuid4()}/days", headers=_dev_headers(principal)
+    )
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.asyncio
+async def test_days_endpoint_caps_limit(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+) -> None:
+    """``?limit>365`` is rejected as a 422 by FastAPI's query validation."""
+    client, s = http_client_with_session
+
+    tenant = uuid.uuid4()
+    await _seed_tenant(s, tenant)
+    truck = await _seed_truck(s, tenant_id=tenant, label="T-1")
+
+    principal = _principal(tenant_id=tenant)
+    resp = await client.get(
+        f"/trucks/{truck.id}/days?limit=10000",
+        headers=_dev_headers(principal),
+    )
+    assert resp.status_code == 422

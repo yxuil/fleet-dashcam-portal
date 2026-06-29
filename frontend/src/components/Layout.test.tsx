@@ -24,10 +24,10 @@ function renderLayout() {
   });
   return render(
     <QueryClientProvider client={qc}>
-      <MemoryRouter initialEntries={["/search"]}>
+      <MemoryRouter initialEntries={["/dashcam"]}>
         <Routes>
           <Route path="/" element={<Layout />}>
-            <Route path="search" element={<div>Search content</div>} />
+            <Route path="dashcam" element={<div>Fleet Cam content</div>} />
           </Route>
         </Routes>
       </MemoryRouter>
@@ -57,11 +57,11 @@ describe("Layout", () => {
 
     expect(screen.getByText("Dashcam Portal")).toBeInTheDocument();
     expect(
-      screen.getByRole("link", { name: "Search" }),
+      screen.getByRole("link", { name: "Fleet Cam" }),
     ).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Trucks" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Cases" })).toBeInTheDocument();
-    expect(screen.getByText("Search content")).toBeInTheDocument();
+    expect(screen.getByText("Fleet Cam content")).toBeInTheDocument();
   });
 
   it("shows Loading… until /me resolves, then the user name", async () => {

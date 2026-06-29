@@ -17,7 +17,7 @@ import { Dropdown, DropdownItem, DropdownLabel, DropdownSeparator } from "./ui/D
 type NavItem = { to: string; label: string };
 
 const NAV_ITEMS: readonly NavItem[] = [
-  { to: "/search", label: "Search" },
+  { to: "/dashcam", label: "Fleet Cam" },
   { to: "/trucks", label: "Trucks" },
   { to: "/cases", label: "Cases" },
 ];

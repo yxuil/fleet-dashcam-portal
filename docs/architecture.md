@@ -22,7 +22,7 @@ That's it. Things you might *expect* but won't find: a live ops map, driver scor
 ```
                 ┌──────────────────────────┐
    Browser ───▶ │  React + Vite (port 5173)│
-                │  - SearchPage            │
+                │  - DashcamPage (Fleet Cam)│
                 │  - ClipPage              │
                 │  - EventTimelinePage     │
                 │  - CaseListPage / Detail │
@@ -104,7 +104,7 @@ dashcam/
 │   │   ├── lib/                ← api, auth, env, queryClient, types
 │   │   ├── hooks/              ← One hook per query / mutation
 │   │   ├── pages/              ← Routes' top-level components
-│   │   ├── components/         ← Layout, ErrorBoundary, ui/, search/, timeline/, cases/
+│   │   ├── components/         ← Layout, ErrorBoundary, ui/, dashcam/, timeline/, cases/
 │   │   └── test/setup.ts       ← Vitest + jest-dom
 │   └── tests/e2e/              ← Playwright smoke specs
 ├── infra/docker-compose.dev.yml
@@ -283,6 +283,10 @@ const closeCase = useCloseCase(id);
 
 The shared `queryKey` factory matters because **mutations write fresh detail back into the cache** on success (see `frontend/src/hooks/useCaseMutations.ts`). That means after `usePatchCase` succeeds, every component reading `useCaseDetail(id)` re-renders with the new data — no refetch needed.
 
+#### Per-user state: upsert on first write
+
+For data like the Fleet Cam truck row order, the canonical place is a JSONB `preferences` column on `users` exposed via `PATCH /me/preferences`. There's a subtlety the dev-mode escape hatch exposes: the principal might not have a `users` row yet (the dev picker mints a `Principal` directly from headers, without seeding `users`). The PATCH handler therefore **upserts** the user row from the principal's claims on first write. This is the canonical pattern for "per-user state that has to work in dev mode too" — see `app/routers/me.py::patch_preferences`. A new feature that stores per-user state should reuse this column rather than spinning up a new table.
+
 ### 4.6 The dev-mode escape hatch
 
 The frontend uses `X-Dev-User-Id` + `X-Dev-Tenant-Id` headers (not minted JWTs) to authenticate during development. The header source is `frontend/src/lib/auth.ts`'s `DEV_USERS` constants — UUIDs derived deterministically via `uuid5(NAMESPACE_DNS, "<slug>.dashcam")` so they match what `python -m app.seed` produces.
@@ -299,17 +303,16 @@ Trace these in the actual code with the file open. They will teach you more than
 
 ### 5.1 "Show me a clip"
 
-1. User navigates to `/search`. `frontend/src/pages/SearchPage.tsx` mounts.
-2. The page reads filters from `?truck_id=...&from=...&to=...` via `useSearchParams`.
-3. Filters are debounced 300ms (`useDebouncedValue`), then passed to `useClips(filters)`.
-4. `useClips` (`hooks/useClips.ts`) does a `useInfiniteQuery` against `GET /clips?...&cursor=...`.
-5. Backend handler: `backend/app/routers/clips.py::list_clips`. It joins `Truck` (always) and outer-joins `Driver` (for the text filter), scopes by `principal.tenant_id`, paginates with cursor.
-6. User clicks a card → `ClipCard` calls `navigate(\`/clips/${id}\`)`.
-7. `ClipPage.tsx` mounts. `useClipDetail(id)` fires `GET /clips/{id}?play=true`.
-8. Backend: `clips.py::get_clip` loads the clip (tenant-scoped 404), calls `audit_record(... action="clip.play_url_minted" ...)`, calls `storage.get_playback_url(tenant_id=..., key=storage_key, clip_id=...)` (which re-verifies the tenant prefix and dispatches on `STORAGE_BACKEND`), commits, returns `ClipDetail` with `playback_url`.
-9. The page sets `<video src={playback_url}>` (the frontend prefixes a relative URL with `API_BASE`). In local mode the browser fetches `GET /clips/{id}/stream` from the backend; in s3 mode it fetches the presigned URL from MinIO directly. Either way the bytes flow back over HTTP Range requests.
-10. On mount, the page also calls `useAuditEmitter`'s `emitPlay()`, which POSTs `/clips/{id}/audit` — a different audit row marking "user actually started playback" vs "URL minted".
-11. On unmount: `emitClosed({ view_duration_s })` fires.
+1. User lands on `/dashcam` (the index redirects there). `frontend/src/pages/DashcamPage.tsx` mounts.
+2. The page reads filters from `?truck_id=...&driver_id=...&from=...&to=...&q=...` via `useSearchParams`. The single popover `TruckDriverPicker` in `components/dashcam/` writes back to those params.
+3. `TruckRowList` resolves the truck display order: `prefs.truck_order` first (from `usePrefs()` → `GET /me/preferences`), then any remaining trucks appended alphabetically.
+4. Each `TruckRow` calls `useTruckDays(truck.id, filters)` → `GET /trucks/{id}/days`. Backend handler: `backend/app/routers/trucks.py::list_truck_days`, which groups clips by `date_trunc('day', started_at)` and returns one representative `first_clip_id` per day.
+5. The user clicks a `<DayCard>` → `navigate(\`/clips/${first_clip_id}\`)`.
+6. `ClipPage.tsx` mounts. `useClipDetail(id)` fires `GET /clips/{id}?play=true`.
+7. Backend: `clips.py::get_clip` loads the clip (tenant-scoped 404), calls `audit_record(... action="clip.play_url_minted" ...)`, calls `storage.get_playback_url(tenant_id=..., key=storage_key, clip_id=...)` (which re-verifies the tenant prefix and dispatches on `STORAGE_BACKEND`), commits, returns `ClipDetail` with `playback_url`.
+8. The page sets `<video src={playback_url}>` (the frontend prefixes a relative URL with `API_BASE`). In local mode the browser fetches `GET /clips/{id}/stream` from the backend; in s3 mode it fetches the presigned URL from MinIO directly. Either way the bytes flow back over HTTP Range requests.
+9. On mount, the page also calls `useAuditEmitter`'s `emitPlay()`, which POSTs `/clips/{id}/audit` — a different audit row marking "user actually started playback" vs "URL minted".
+10. On unmount: `emitClosed({ view_duration_s })` fires.
 
 Total moving parts: 1 React page, 2 hooks, 2 (or 3 in local mode) backend endpoints, 3 audit rows in postgres, 1 file fetch (local stream or MinIO signed URL). Read every file in the chain once.
 

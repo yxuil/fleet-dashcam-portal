@@ -36,7 +36,6 @@ import {
   API_BASE,
   apiAuditFor,
   firstHighSeverityEventWithClip,
-  firstSeededClipForTruck,
   firstSeededTruckForTenant,
 } from "./helpers";
 
@@ -62,10 +61,10 @@ async function authAsAcmeAdmin(page: Page): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Scenario (a) — Search & play
+// Scenario (a) — Fleet Cam picker → day card → play
 // ---------------------------------------------------------------------------
 
-test("(a) search → play clip → audit shows play_url_minted", async ({
+test("(a) fleet cam → pick truck → click day card → audit shows play_url_minted", async ({
   page,
   playwright,
 }) => {
@@ -76,44 +75,38 @@ test("(a) search → play clip → audit shows play_url_minted", async ({
     extraHTTPHeaders: ACME_HEADERS,
   });
 
-  // Pre-flight: pick a truck and one of its clips so we know exactly which
-  // card to click on the page.
+  // Pre-flight: pick a truck so we know which row to drive in the UI.
   const truck = await firstSeededTruckForTenant(api);
-  const clip = await firstSeededClipForTruck(api, truck.id);
 
-  await page.goto("/search");
+  await page.goto("/dashcam");
 
   // The bottom-right dev user picker should mount and show our active user.
   // It's our visible proof that localStorage injection worked.
   await expect(page.getByTestId("dev-user-picker")).toBeVisible();
   await expect(page.getByTestId("dev-user-picker")).toContainText("Acme");
 
-  // Filter to the chosen truck. The filter-panel checkbox testid is
-  // `filter-trucks-<truckId>`. We `.click()` rather than `.check()` —
-  // the controlled-checkbox + react-router setSearchParams round-trip
-  // occasionally races `.check()`'s state-change verification, and a
-  // click matches what the user actually does. Then we wait for the
-  // URL to mirror the truck filter so subsequent debounce-fetch races
-  // are bounded by network not React commit timing.
-  const truckCheckbox = page.getByTestId(`filter-trucks-${truck.id}`);
-  await expect(truckCheckbox).toBeVisible();
-  await truckCheckbox.click();
-  await expect(page).toHaveURL(new RegExp(`truck=${truck.id}`));
+  // Open the truck/driver picker and select our truck via its row in the
+  // Truck section. The testid is `truck-driver-picker-truck-<truckId>`.
+  await page.getByTestId("truck-driver-picker-trigger").click();
+  await expect(page.getByTestId("truck-driver-picker-popover")).toBeVisible();
+  await page.getByTestId(`truck-driver-picker-truck-${truck.id}`).click();
+  await page.getByTestId("truck-driver-picker-apply").click();
+  await expect(page).toHaveURL(new RegExp(`truck_id=${truck.id}`));
 
-  // Wait for results to refresh after the 300ms debounce. The grid mounts
-  // once items are loaded; the specific clip card carries `clip-card-<id>`.
-  const card = page.getByTestId(`clip-card-${clip.id}`);
+  // Wait for the truck row to mount, then click the first day card.
+  const row = page.getByTestId(`truck-row-${truck.id}`);
+  await expect(row).toBeVisible({ timeout: 10_000 });
+  const card = row.locator("[data-testid^=\"day-card-\"]").first();
   await expect(card).toBeVisible({ timeout: 10_000 });
   await card.click();
 
-  // Land on detail.
-  await expect(page).toHaveURL(new RegExp(`/clips/${clip.id}$`));
+  // Land on detail. The card opens the day's first clip; we don't know
+  // its id ahead of time, so just match the shape of the URL.
+  await expect(page).toHaveURL(/\/clips\/[0-9a-f-]{36}$/);
+  const clipId = new URL(page.url()).pathname.split("/").pop()!;
 
   // The video element should mount with a backend-pointing src once the
-  // detail GET resolves. In local-storage mode (T17 default) the URL is
-  // the relative stream route prefixed with API_BASE; in s3 mode it'd be
-  // a MinIO signed URL. Accept either shape — the audit row below is the
-  // load-bearing assertion.
+  // detail GET resolves. Accept either local stream route or MinIO URL.
   const video = page.getByTestId("clip-video");
   await expect(video).toBeVisible({ timeout: 10_000 });
   await expect(video).toHaveAttribute(
@@ -123,17 +116,58 @@ test("(a) search → play clip → audit shows play_url_minted", async ({
   );
 
   // The backend writes `clip.play_url_minted` on every GET /clips/:id?play=true.
-  // Confirm via /audit.
-  const audit = await apiAuditFor(api, "clip", clip.id);
+  const audit = await apiAuditFor(api, "clip", clipId);
   const minted = audit.find((a) => a.action === "clip.play_url_minted");
   expect(
     minted,
-    `expected a clip.play_url_minted audit for clip ${clip.id}; got actions: ${audit
+    `expected a clip.play_url_minted audit for clip ${clipId}; got actions: ${audit
       .map((a) => a.action)
       .join(", ")}`,
   ).toBeTruthy();
 
   await api.dispose();
+});
+
+// ---------------------------------------------------------------------------
+// Scenario (d) — reorder persists across reloads
+// ---------------------------------------------------------------------------
+
+test("(d) reorder truck row persists across reload", async ({ page }) => {
+  await authAsAcmeAdmin(page);
+
+  await page.goto("/dashcam");
+
+  // Capture the labels of the first two visible rows.
+  const rows = page.locator("[data-testid^=\"truck-row-\"]");
+  await expect(rows.first()).toBeVisible({ timeout: 10_000 });
+  const firstLabelBefore = await rows
+    .first()
+    .getByTestId("truck-row-label")
+    .innerText();
+  const secondLabelBefore = await rows
+    .nth(1)
+    .getByTestId("truck-row-label")
+    .innerText();
+
+  // Move the first row down. The button id encodes the truck id, so we
+  // resolve it from the row's data-testid attribute.
+  const firstRowTestId = await rows.first().getAttribute("data-testid");
+  const truckId = firstRowTestId!.replace("truck-row-", "");
+  await page.getByTestId(`truck-row-${truckId}-down`).click();
+
+  // Reload and confirm the order has flipped.
+  await page.reload();
+  await expect(rows.first()).toBeVisible({ timeout: 10_000 });
+  const firstLabelAfter = await rows
+    .first()
+    .getByTestId("truck-row-label")
+    .innerText();
+  const secondLabelAfter = await rows
+    .nth(1)
+    .getByTestId("truck-row-label")
+    .innerText();
+  expect(firstLabelAfter).toBe(secondLabelBefore);
+  expect(secondLabelAfter).toBe(firstLabelBefore);
 });
 
 // ---------------------------------------------------------------------------

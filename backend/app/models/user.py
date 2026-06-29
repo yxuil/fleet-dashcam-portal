@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
 from sqlalchemy import ARRAY, ForeignKey, Index, String, UniqueConstraint, text
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
@@ -34,4 +35,13 @@ class User(Base):
         ARRAY(String),
         nullable=False,
         server_default=text("'{}'::text[]"),
+    )
+    # Per-user opaque JSON dictionary for client-side preferences such as
+    # the Fleet Cam truck row ordering. Schema is intentionally open — the
+    # frontend may stash arbitrary additional keys here and the PATCH
+    # handler round-trips unknown fields untouched.
+    preferences: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=text("'{}'::jsonb"),
     )

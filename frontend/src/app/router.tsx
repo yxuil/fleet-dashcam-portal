@@ -12,9 +12,9 @@ import { createBrowserRouter, Navigate } from "react-router-dom";
 import { Layout } from "@/components/Layout";
 import { CaseDetailPage, CasesPage } from "@/pages/CasesPage";
 import { ClipPage } from "@/pages/ClipPage";
+import { DashcamPage } from "@/pages/DashcamPage";
 import { EventTimelinePage } from "@/pages/EventTimelinePage";
 import { NotFoundPage } from "@/pages/NotFoundPage";
-import { SearchPage } from "@/pages/SearchPage";
 import { TrucksPage } from "@/pages/TrucksPage";
 
 export const router = createBrowserRouter([
@@ -22,8 +22,11 @@ export const router = createBrowserRouter([
     path: "/",
     element: <Layout />,
     children: [
-      { index: true, element: <Navigate to="/search" replace /> },
-      { path: "search", element: <SearchPage /> },
+      { index: true, element: <Navigate to="/dashcam" replace /> },
+      { path: "dashcam", element: <DashcamPage /> },
+      // Legacy /search bookmarks land here too — kept as a redirect so
+      // T17's bookmarks don't dead-end at the NotFound page.
+      { path: "search", element: <Navigate to="/dashcam" replace /> },
       { path: "trucks", element: <TrucksPage /> },
       {
         path: "trucks/:id/events",

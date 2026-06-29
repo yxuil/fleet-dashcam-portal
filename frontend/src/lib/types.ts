@@ -50,6 +50,29 @@ export type TruckOut = {
   last_seen_at: string | null;
 };
 
+/**
+ * One day's worth of clips for a truck — served by
+ * `GET /trucks/{id}/days`. The Fleet Cam row scroller renders one of
+ * these per card; `first_clip_id` is the click-through target.
+ */
+export type TruckDay = {
+  date: string;
+  clip_count: number;
+  first_clip_id: string;
+  total_duration_s: number;
+};
+
+/**
+ * Per-user opaque preferences blob served by `GET /me/preferences`.
+ *
+ * `truck_order` is the only known key today (Fleet Cam row ordering);
+ * the index signature lets us round-trip future keys without churn.
+ */
+export type Preferences = {
+  truck_order?: string[];
+  [k: string]: unknown;
+};
+
 /** Driver row served by `GET /drivers`. */
 export type DriverOut = {
   id: string;

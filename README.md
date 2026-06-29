@@ -180,8 +180,10 @@ All routes require a `Principal` (real JWT or dev headers). All reads are
 auto-scoped to the caller's tenant.
 
 ```
-# Auth
+# Auth + per-user state
 GET    /me
+GET    /me/preferences
+PATCH  /me/preferences
 
 # Clips
 GET    /clips
@@ -208,6 +210,7 @@ GET    /audit
 # Trucks / drivers (read-only, for filter chips)
 GET    /trucks
 GET    /trucks/{truck_id}
+GET    /trucks/{truck_id}/days
 GET    /drivers
 
 # Ingest stub

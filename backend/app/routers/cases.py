@@ -52,10 +52,11 @@ import base64
 import json
 import re
 from datetime import UTC, datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field
 from sqlalchemy import and_, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -89,6 +90,13 @@ DEFAULT_CASES_LIMIT: int = 50
 
 #: How many audit entries to include in the detail response.
 RECENT_AUDIT_LIMIT: int = 50
+
+#: Closed set of audit actions the frontend may emit on a case via
+#: :func:`post_case_audit`. Kept tight so the audit_log table can't be
+#: spammed with arbitrary action strings from the client (e.g. nobody
+#: should be able to fabricate a ``case.closed`` audit without going
+#: through the dedicated close endpoint).
+ALLOWED_CLIENT_CASE_AUDIT_ACTIONS: frozenset[str] = frozenset({"case.note_added"})
 
 #: Matches a generated case number, e.g. ``C-2026-0042``.
 _NUMBER_RE = re.compile(r"^C-(\d{4})-(\d{4})$")
@@ -505,3 +513,80 @@ async def close_case(
     await session.commit()
 
     return await _build_detail(session, case=case, tenant_id=principal.tenant_id)
+
+
+# ---------------------------------------------------------------------------
+# Routes — client-emitted audit (notes)
+# ---------------------------------------------------------------------------
+
+
+class CaseAuditRequest(BaseModel):
+    """Body for ``POST /cases/{id}/audit``.
+
+    The frontend doesn't have a database handle, and we don't want it to
+    — actor_user_id, tenant_id, and row shape must be authoritative. This
+    endpoint is the controlled wrapper that lets the case-detail UI emit
+    a narrow set of breadcrumb-style audit events (currently just
+    ``case.note_added``).
+
+    ``action`` is restricted to :data:`ALLOWED_CLIENT_CASE_AUDIT_ACTIONS`.
+    Anything else returns 400 (so the UI can't fabricate, say, a
+    ``case.closed`` row outside the dedicated close endpoint).
+    """
+
+    action: Literal["case.note_added"]
+    payload: dict[str, Any] | None = Field(default=None)
+
+
+@router.post(
+    "/cases/{case_id}/audit",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def post_case_audit(
+    case_id: UUID,
+    body: CaseAuditRequest,
+    principal: Annotated[Principal, Depends(current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> None:
+    """Append one client-emitted audit row to a case.
+
+    Used by the case detail page (T14) to record:
+
+    * ``case.note_added`` — a free-text breadcrumb the user typed into
+      the Notes tab. ``payload`` should be ``{"text": "..."}``; this is
+      enforced only loosely (we accept whatever JSON-serialisable shape
+      the client sends so the audit log stays forward-compatible).
+
+    Tenant isolation: a case whose ``tenant_id`` doesn't match the
+    caller's produces ``404 not found`` — the same response as a truly
+    missing row — so callers can't enumerate other tenants' case ids by
+    probing this endpoint.
+    """
+    if body.action not in ALLOWED_CLIENT_CASE_AUDIT_ACTIONS:
+        # ``Literal`` already enforces this for well-formed requests;
+        # defence-in-depth: a future schema relaxation still trips here.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="unsupported action",
+        )
+
+    # Tenant-scoped existence check. We don't need the row itself, just
+    # confirmation it exists for the caller's tenant.
+    stmt = select(Case.id).where(
+        Case.id == case_id, Case.tenant_id == principal.tenant_id
+    )
+    if (await session.execute(stmt)).scalar_one_or_none() is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="not found",
+        )
+
+    await audit_record(
+        session,
+        principal=principal,
+        action=body.action,
+        target_type="case",
+        target_id=case_id,
+        payload=body.payload if body.payload is not None else {},
+    )
+    await session.commit()

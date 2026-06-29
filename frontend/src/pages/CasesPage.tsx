@@ -1,20 +1,10 @@
-import { Placeholder } from "./Placeholder";
+/**
+ * Re-exports the case list and detail pages so existing imports (the
+ * router, tests) keep working without churning each call site.
+ *
+ * The implementations live in CaseListPage.tsx and CaseDetailPage.tsx —
+ * one file per page so they don't crowd each other.
+ */
 
-export function CasesPage() {
-  return (
-    <Placeholder
-      title="Cases"
-      hint="Case list and management. Implemented in T14."
-    />
-  );
-}
-
-export function CaseDetailPage() {
-  return (
-    <Placeholder
-      title="Case"
-      paramNames={["id"]}
-      hint="Case detail view. Implemented in T14."
-    />
-  );
-}
+export { CaseListPage as CasesPage } from "./CaseListPage";
+export { CaseDetailPage } from "./CaseDetailPage";

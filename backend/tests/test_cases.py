@@ -939,6 +939,127 @@ async def test_close_case_rejects_empty_reason(
 
 
 # ---------------------------------------------------------------------------
+# Tests — POST /cases/{id}/audit (client-emitted notes audit)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_post_case_audit_writes_note_added(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+) -> None:
+    """A well-formed ``case.note_added`` POST writes one audit row."""
+    client, s = http_client_with_session
+    tenant_id, user_id = await _seed_tenant_with_creator(s)
+    principal = _principal(tenant_id=tenant_id, user_id=user_id)
+
+    case = await _create_via_api(client, principal)
+
+    resp = await client.post(
+        f"/cases/{case.id}/audit",
+        json={"action": "case.note_added", "payload": {"text": "first breadcrumb"}},
+        headers=_dev_headers(principal),
+    )
+    assert resp.status_code == 204, resp.text
+
+    rows = (
+        (
+            await s.execute(
+                select(AuditLog).where(
+                    AuditLog.target_type == "case",
+                    AuditLog.target_id == case.id,
+                    AuditLog.action == "case.note_added",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 1
+    assert rows[0].payload == {"text": "first breadcrumb"}
+    assert rows[0].actor_user_id == user_id
+    assert rows[0].tenant_id == tenant_id
+
+
+@pytest.mark.asyncio
+async def test_post_case_audit_rejects_unknown_action(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+) -> None:
+    """Any ``action`` outside the allow-list is rejected (422 or 400)."""
+    client, s = http_client_with_session
+    tenant_id, user_id = await _seed_tenant_with_creator(s)
+    principal = _principal(tenant_id=tenant_id, user_id=user_id)
+
+    case = await _create_via_api(client, principal)
+
+    # ``case.closed`` is a legitimate audit action elsewhere but NOT one
+    # the frontend may emit directly — it must go through POST /close.
+    resp = await client.post(
+        f"/cases/{case.id}/audit",
+        json={"action": "case.closed", "payload": {"reason": "spoof"}},
+        headers=_dev_headers(principal),
+    )
+    # Pydantic ``Literal`` validation kicks in first → 422.
+    assert resp.status_code in (400, 422), resp.text
+
+    # And no audit row is written.
+    rows = (
+        (
+            await s.execute(
+                select(AuditLog).where(
+                    AuditLog.target_type == "case",
+                    AuditLog.target_id == case.id,
+                    AuditLog.action == "case.closed",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_post_case_audit_cross_tenant_returns_404(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+) -> None:
+    """Calling /cases/{id}/audit for another tenant's case yields 404."""
+    client, s = http_client_with_session
+    tenant_a, user_a = await _seed_tenant_with_creator(s)
+    tenant_b, user_b = await _seed_tenant_with_creator(s)
+    principal_a = _principal(tenant_id=tenant_a, user_id=user_a)
+    principal_b = _principal(tenant_id=tenant_b, user_id=user_b)
+
+    case_a = await _create_via_api(client, principal_a)
+
+    # Tenant B trying to write a note against tenant A's case → 404.
+    resp = await client.post(
+        f"/cases/{case_a.id}/audit",
+        json={"action": "case.note_added", "payload": {"text": "i should not exist"}},
+        headers=_dev_headers(principal_b),
+    )
+    assert resp.status_code == 404, resp.text
+
+    # No audit row was written for tenant A or tenant B against that case.
+    rows = (
+        (
+            await s.execute(
+                select(AuditLog).where(
+                    AuditLog.target_type == "case",
+                    AuditLog.target_id == case_a.id,
+                    AuditLog.action == "case.note_added",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert rows == []
+
+
+# ---------------------------------------------------------------------------
 # Touch the imports referenced via type checking to keep ruff/mypy happy.
 # ---------------------------------------------------------------------------
 _ = CaseRow  # re-exported for symmetry in case future tests need it

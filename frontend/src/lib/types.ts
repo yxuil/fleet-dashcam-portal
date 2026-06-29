@@ -104,3 +104,83 @@ export type EventListResponse = {
   items: EventRow[];
   next_cursor: string | null;
 };
+
+/**
+ * Case status enum — mirrors `app.models.case.CaseStatus`.
+ *
+ * `"closed"` is a valid value here (returned by the backend) but is NOT
+ * an allowed value for `PATCH /cases/:id` — the dedicated
+ * `POST /cases/:id/close` endpoint must be used so a reason is captured.
+ * See `PatchableCaseStatus` for the patchable subset.
+ */
+export const CASE_STATUSES = [
+  "open",
+  "under_review",
+  "approved",
+  "closed",
+] as const;
+export type CaseStatus = (typeof CASE_STATUSES)[number];
+
+/** Statuses the user can transition a case to via PATCH. */
+export const PATCHABLE_CASE_STATUSES = [
+  "open",
+  "under_review",
+  "approved",
+] as const;
+export type PatchableCaseStatus = (typeof PATCHABLE_CASE_STATUSES)[number];
+
+/**
+ * One audit row in API responses — mirrors `app.audit.AuditEntry`.
+ *
+ * `payload` is arbitrary JSON. The Notes tab inspects `payload.text`
+ * for `case.note_added` rows; everything else renders the payload
+ * generically.
+ */
+export type AuditEntry = {
+  id: number;
+  tenant_id: string;
+  actor_user_id: string | null;
+  action: string;
+  target_type: string;
+  target_id: string | null;
+  payload: Record<string, unknown>;
+  occurred_at: string;
+};
+
+/** One attached-clip entry inside `CaseDetail`. */
+export type AttachedClip = {
+  clip_id: string;
+  attached_at: string;
+  attached_by: string;
+  note: string | null;
+  truck_label: string;
+  started_at: string;
+};
+
+/** Compact case row served by `GET /cases`. */
+export type CaseRow = {
+  id: string;
+  tenant_id: string;
+  number: string;
+  external_ref: string | null;
+  requester_name: string | null;
+  requester_org: string | null;
+  incident_at: string | null;
+  status: CaseStatus;
+  assignee_user_id: string | null;
+  due_at: string | null;
+  created_by: string;
+  created_at: string;
+};
+
+/** Full case detail served by `GET /cases/:id`. */
+export type CaseDetail = CaseRow & {
+  clips: AttachedClip[];
+  recent_audit: AuditEntry[];
+};
+
+/** Paginated wrapper for `GET /cases`. */
+export type CaseListResponse = {
+  items: CaseRow[];
+  next_cursor: string | null;
+};

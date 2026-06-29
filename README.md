@@ -50,11 +50,27 @@ macOS / Windows / Linux because it uses the compose network):
 docker compose -f infra/docker-compose.dev.yml run --rm minio-init
 ```
 
+## Database migrations
+
+```bash
+# Start Postgres first
+docker compose -f infra/docker-compose.dev.yml up -d postgres
+
+cd backend
+uv run alembic upgrade head      # apply all migrations
+uv run alembic downgrade base    # roll everything back
+uv run alembic revision --autogenerate -m "<msg>"   # new migration
+```
+
 ## Tests
 
 ```bash
 # Backend smoke tests
 cd backend && uv run pytest
+
+# Backend schema round-trip test (needs Postgres + migrations applied)
+docker compose -f infra/docker-compose.dev.yml up -d postgres
+cd backend && uv run alembic upgrade head && uv run pytest -k schema
 
 # Frontend unit tests
 cd frontend && npm test

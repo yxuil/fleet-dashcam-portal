@@ -21,6 +21,19 @@ export type ClipRow = {
   ingested_at: string;
 };
 
+/**
+ * Full clip detail served by `GET /clips/{id}`.
+ *
+ * `playback_url` is only populated when the request is made with
+ * `?play=true` — otherwise it's `null` and we shouldn't try to render a
+ * `<video>` source from it.
+ */
+export type ClipDetail = ClipRow & {
+  sha256: string | null;
+  dashcam_firmware: string | null;
+  playback_url: string | null;
+};
+
 /** Paginated wrapper for `GET /clips`. */
 export type ClipListResponse = {
   items: ClipRow[];
@@ -62,3 +75,32 @@ export type EventType = (typeof EVENT_TYPES)[number];
 
 export const EVENT_SEVERITIES = ["critical", "high", "medium", "low"] as const;
 export type EventSeverity = (typeof EVENT_SEVERITIES)[number];
+
+/**
+ * Event row served by `GET /events`.
+ *
+ * Mirrors the backend `EventRow` Pydantic model. The video-player page
+ * uses these to render harsh-event markers on the clip timeline;
+ * `telemetry.speed_kmh` (when present) feeds the speed read-out.
+ */
+export type EventRow = {
+  id: string;
+  tenant_id: string;
+  truck_id: string;
+  truck_label: string;
+  driver_id: string | null;
+  driver_name: string | null;
+  clip_id: string | null;
+  occurred_at: string;
+  type: EventType;
+  severity: EventSeverity;
+  telemetry: Record<string, unknown>;
+  gps_lat: number | null;
+  gps_lng: number | null;
+};
+
+/** Paginated wrapper for `GET /events`. */
+export type EventListResponse = {
+  items: EventRow[];
+  next_cursor: string | null;
+};

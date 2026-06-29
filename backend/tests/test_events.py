@@ -33,6 +33,7 @@ from app.db import get_session
 from app.main import app
 from app.models.audit import AuditLog
 from app.models.case import Case
+from app.models.clip import Clip
 from app.models.event import Event, EventSeverity, EventType
 from app.models.tenant import Tenant
 from app.models.truck import Truck
@@ -168,6 +169,35 @@ async def _seed_truck(
     session.add(truck)
     await session.flush()
     return truck
+
+
+async def _seed_clip(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    truck_id: uuid.UUID,
+    started_at: datetime,
+) -> Clip:
+    """Minimal clip row used by the ``clip_id`` filter test.
+
+    Events have an FK to clips, so we can't reference a synthetic UUID
+    without first inserting a real row. The other shared seed helpers
+    don't need a clip, so we keep this one local.
+    """
+    clip_id = uuid.uuid4()
+    clip = Clip(
+        id=clip_id,
+        tenant_id=tenant_id,
+        truck_id=truck_id,
+        driver_id=None,
+        started_at=started_at,
+        ended_at=started_at + timedelta(seconds=30),
+        duration_s=30,
+        storage_key=f"{tenant_id}/2026/06/29/{clip_id}.mp4",
+    )
+    session.add(clip)
+    await session.flush()
+    return clip
 
 
 async def _seed_event(
@@ -503,6 +533,77 @@ async def test_trucks_events_returns_404_for_other_tenant_truck(
     # No mention of "forbidden" — we don't want to leak cross-tenant existence.
     detail = resp.json().get("detail", "")
     assert "forbid" not in str(detail).lower()
+
+
+@pytest.mark.asyncio
+async def test_list_events_filter_by_clip_id(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+) -> None:
+    """``?clip_id=`` must restrict results to events linked to that clip.
+
+    Added in T12 so the video-player page can render harsh-event timeline
+    markers without an unrelated-event N+1.
+    """
+    client, s = http_client_with_session
+
+    tenant = uuid.uuid4()
+    await _seed_tenant(s, tenant)
+    truck = await _seed_truck(s, tenant_id=tenant, label="T-cf")
+
+    # We seed four events: two pointing at the same clip, one at a
+    # different clip, one unlinked. The unlinked / other-clip ones share
+    # all other fields so we can be confident the filter is keying on
+    # ``clip_id`` specifically.
+    base = datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC)
+    target_clip = await _seed_clip(
+        s, tenant_id=tenant, truck_id=truck.id, started_at=base
+    )
+    other_clip = await _seed_clip(
+        s, tenant_id=tenant, truck_id=truck.id, started_at=base
+    )
+
+    e_match_1 = await _seed_event(
+        s,
+        tenant_id=tenant,
+        truck_id=truck.id,
+        occurred_at=base,
+        clip_id=target_clip.id,
+    )
+    e_match_2 = await _seed_event(
+        s,
+        tenant_id=tenant,
+        truck_id=truck.id,
+        occurred_at=base + timedelta(minutes=1),
+        clip_id=target_clip.id,
+    )
+    e_other = await _seed_event(
+        s,
+        tenant_id=tenant,
+        truck_id=truck.id,
+        occurred_at=base + timedelta(minutes=2),
+        clip_id=other_clip.id,
+    )
+    e_unlinked = await _seed_event(
+        s,
+        tenant_id=tenant,
+        truck_id=truck.id,
+        occurred_at=base + timedelta(minutes=3),
+        clip_id=None,
+    )
+
+    principal = _principal(tenant_id=tenant)
+    resp = await client.get(
+        "/events",
+        params={"clip_id": str(target_clip.id)},
+        headers=_dev_headers(principal),
+    )
+    assert resp.status_code == 200, resp.text
+    body = EventListResponse.model_validate(resp.json())
+    ids = {row.id for row in body.items}
+    assert ids == {e_match_1.id, e_match_2.id}
+    assert e_other.id not in ids
+    assert e_unlinked.id not in ids
 
 
 @pytest.mark.asyncio

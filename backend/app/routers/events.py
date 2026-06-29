@@ -5,6 +5,8 @@ Filtering on the list endpoints
 * ``truck_id`` / ``driver_id`` — optional exact-match filters. ``driver_id``
   is accepted for API symmetry with ``/clips`` but currently has no effect
   on the event row itself (events have no direct driver FK in T7).
+* ``clip_id`` — optional exact-match on the event's nullable ``clip_id`` FK.
+  Used by T12 to render harsh-event markers on the clip timeline.
 * ``from`` / ``to`` — ISO 8601 timestamps, inclusive of ``occurred_at``.
 * ``severity`` / ``type`` — repeatable query params (e.g.
   ``?severity=high&severity=critical``) interpreted as set membership.
@@ -94,6 +96,7 @@ def _apply_event_filters(
     stmt: Select[tuple[Event]],
     *,
     truck_id: UUID | None,
+    clip_id: UUID | None,
     from_: datetime | None,
     to: datetime | None,
     severity: list[EventSeverity],
@@ -107,6 +110,8 @@ def _apply_event_filters(
     """
     if truck_id is not None:
         stmt = stmt.where(Event.truck_id == truck_id)
+    if clip_id is not None:
+        stmt = stmt.where(Event.clip_id == clip_id)
     if from_ is not None:
         stmt = stmt.where(Event.occurred_at >= from_)
     if to is not None:
@@ -123,6 +128,7 @@ async def _query_events_page(
     *,
     tenant_id: UUID,
     truck_id: UUID | None,
+    clip_id: UUID | None,
     from_: datetime | None,
     to: datetime | None,
     severity: list[EventSeverity],
@@ -147,6 +153,7 @@ async def _query_events_page(
     stmt = _apply_event_filters(
         stmt,
         truck_id=truck_id,
+        clip_id=clip_id,
         from_=from_,
         to=to,
         severity=severity,
@@ -204,6 +211,7 @@ async def list_events(
     session: Annotated[AsyncSession, Depends(get_session)],
     truck_id: Annotated[UUID | None, Query()] = None,
     driver_id: Annotated[UUID | None, Query()] = None,  # noqa: ARG001 — see docstring
+    clip_id: Annotated[UUID | None, Query()] = None,
     from_: Annotated[datetime | None, Query(alias="from")] = None,
     to: Annotated[datetime | None, Query()] = None,
     severity: Annotated[list[EventSeverity] | None, Query()] = None,
@@ -218,11 +226,17 @@ async def list_events(
     direct driver FK, so there's nothing to filter on yet. Documenting it
     in the signature still lets the OpenAPI schema and frontend planning
     proceed without churn.
+
+    ``clip_id`` restricts results to events whose nullable ``clip_id`` FK
+    matches. Used by T12's video-player page to render harsh-event markers
+    on the clip timeline. Still tenant-scoped: a clip from another tenant
+    will simply yield zero rows.
     """
     return await _query_events_page(
         session,
         tenant_id=principal.tenant_id,
         truck_id=truck_id,
+        clip_id=clip_id,
         from_=from_,
         to=to,
         severity=severity or [],
@@ -266,6 +280,7 @@ async def list_truck_events(
         session,
         tenant_id=principal.tenant_id,
         truck_id=truck_id,
+        clip_id=None,
         from_=from_,
         to=to,
         severity=severity or [],

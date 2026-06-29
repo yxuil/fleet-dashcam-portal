@@ -28,10 +28,11 @@ from __future__ import annotations
 import base64
 import json
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -46,6 +47,13 @@ from app.schemas.clip import ClipDetail, ClipListResponse, ClipRow
 from app.storage import DEFAULT_SIGNED_URL_TTL_S, get_signed_url
 
 router = APIRouter(tags=["clips"])
+
+#: Closed set of audit actions the player UI may emit via
+#: :func:`post_clip_audit`. Anything else is rejected with 400 so we don't
+#: open the audit_log table up to arbitrary user-controlled action strings.
+ALLOWED_CLIENT_AUDIT_ACTIONS: frozenset[str] = frozenset(
+    {"clip.play", "clip.scrub", "clip.closed"}
+)
 
 #: Hard upper bound on page size, mirroring ``GET /audit``.
 MAX_CLIPS_LIMIT: int = 200
@@ -221,3 +229,84 @@ async def get_clip(
         detail = detail.model_copy(update={"playback_url": url})
 
     return detail
+
+
+# ---------------------------------------------------------------------------
+# Player-emitted audit endpoint
+# ---------------------------------------------------------------------------
+
+
+class ClipAuditRequest(BaseModel):
+    """Body schema for ``POST /clips/{id}/audit``.
+
+    The frontend can't write audit rows directly — it has no database
+    handle, and we wouldn't want it to: tenant scoping, the
+    actor_user_id, and the row shape all need to be authoritative. This
+    endpoint is the controlled wrapper that lets the video player emit a
+    tightly-scoped set of player-lifecycle audit events.
+
+    ``action`` is restricted to :data:`ALLOWED_CLIENT_AUDIT_ACTIONS`.
+    Anything else is rejected with 400 by :func:`post_clip_audit` so we
+    don't open the audit_log table up to arbitrary user-controlled action
+    strings (e.g. the frontend can't fabricate a ``clip.deleted`` row).
+    """
+
+    action: Literal["clip.play", "clip.scrub", "clip.closed"]
+    payload: dict[str, Any] | None = Field(default=None)
+
+
+@router.post(
+    "/clips/{clip_id}/audit",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def post_clip_audit(
+    clip_id: UUID,
+    body: ClipAuditRequest,
+    principal: Annotated[Principal, Depends(current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> None:
+    """Append one player-lifecycle audit row.
+
+    Used by the video-player page (T12) to record:
+
+    * ``clip.play`` — fired once when playback actually starts (we already
+      log ``clip.play_url_minted`` on the GET that mints the signed URL;
+      this captures the user actually hitting play).
+    * ``clip.scrub`` — fired on seek, debounced client-side to once per
+      750 ms so we don't flood the table.
+    * ``clip.closed`` — fired on unmount with the accumulated view
+      duration in the payload.
+
+    Tenant isolation: a clip whose ``tenant_id`` doesn't match the
+    caller's produces a ``404 not found`` — the same response as a truly
+    missing row — so callers can't enumerate other tenants' ids by
+    probing the audit endpoint either.
+    """
+    if body.action not in ALLOWED_CLIENT_AUDIT_ACTIONS:
+        # Pydantic's ``Literal`` already enforces this for well-formed
+        # requests, but defence-in-depth: if the schema is ever relaxed
+        # the runtime check still holds the contract.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="unsupported action",
+        )
+
+    stmt = select(Clip.id).where(
+        Clip.id == clip_id, Clip.tenant_id == principal.tenant_id
+    )
+    result = await session.execute(stmt)
+    if result.scalar_one_or_none() is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="not found",
+        )
+
+    await audit_record(
+        session,
+        principal=principal,
+        action=body.action,
+        target_type="clip",
+        target_id=clip_id,
+        payload=body.payload if body.payload is not None else {},
+    )
+    await session.commit()

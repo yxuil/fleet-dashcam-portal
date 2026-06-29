@@ -695,3 +695,130 @@ async def test_get_clip_unknown_id_returns_404(
     bogus = uuid.uuid4()
     resp = await client.get(f"/clips/{bogus}", headers=_dev_headers(principal))
     assert resp.status_code == 404, resp.text
+
+
+# ---------------------------------------------------------------------------
+# Tests — POST /clips/{id}/audit (T12)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_post_clip_audit_writes_row_with_allowed_action(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+) -> None:
+    """Player-emitted ``clip.play`` must persist as a tenant-scoped audit row."""
+    client, s = http_client_with_session
+
+    tenant = uuid.uuid4()
+    await _seed_tenant(s, tenant)
+    truck = await _seed_truck(s, tenant_id=tenant, label="T-pa")
+    base = datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC)
+    clip = await _seed_clip(
+        s, tenant_id=tenant, truck_id=truck.id, driver_id=None, started_at=base
+    )
+
+    principal = _principal(tenant_id=tenant)
+    resp = await client.post(
+        f"/clips/{clip.id}/audit",
+        json={"action": "clip.play", "payload": {"view_duration_s": 0}},
+        headers=_dev_headers(principal),
+    )
+    assert resp.status_code == 204, resp.text
+
+    # The audit row should be readable via the model directly. We don't
+    # rely on GET /audit here because the test session's connection is
+    # different from a fresh request; instead we query the same session.
+    rows = (
+        await s.execute(
+            select(AuditLog).where(
+                AuditLog.target_id == clip.id,
+                AuditLog.action == "clip.play",
+            )
+        )
+    ).scalars().all()
+    assert len(rows) == 1
+    audit = rows[0]
+    assert audit.tenant_id == tenant
+    assert audit.actor_user_id == principal.user_id
+    assert audit.target_type == "clip"
+    assert audit.payload == {"view_duration_s": 0}
+
+
+@pytest.mark.asyncio
+async def test_post_clip_audit_rejects_unknown_action(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+) -> None:
+    """Anything outside the closed-set of player actions must 422/400 and audit nothing.
+
+    Pydantic's ``Literal`` validator raises 422 on a bad action; the
+    runtime guard in the handler catches anything that slips past
+    (e.g. if the schema is ever relaxed) with 400. Either way the row
+    must NOT land in audit_log.
+    """
+    client, s = http_client_with_session
+
+    tenant = uuid.uuid4()
+    await _seed_tenant(s, tenant)
+    truck = await _seed_truck(s, tenant_id=tenant, label="T-pa-bad")
+    base = datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC)
+    clip = await _seed_clip(
+        s, tenant_id=tenant, truck_id=truck.id, driver_id=None, started_at=base
+    )
+
+    principal = _principal(tenant_id=tenant)
+    resp = await client.post(
+        f"/clips/{clip.id}/audit",
+        json={"action": "clip.deleted", "payload": {}},
+        headers=_dev_headers(principal),
+    )
+    # Pydantic Literal rejects with 422; the handler's belt-and-braces
+    # check would surface as 400. Either is fine — what matters is
+    # nothing got written.
+    assert resp.status_code in (400, 422), resp.text
+
+    rows = (
+        await s.execute(
+            select(AuditLog).where(AuditLog.target_id == clip.id)
+        )
+    ).scalars().all()
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_post_clip_audit_cross_tenant_returns_404(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+) -> None:
+    """Tenant B posting audit for tenant A's clip must get an honest 404."""
+    client, s = http_client_with_session
+
+    tenant_a = uuid.uuid4()
+    tenant_b = uuid.uuid4()
+    await _seed_tenant(s, tenant_a)
+    await _seed_tenant(s, tenant_b)
+
+    truck_a = await _seed_truck(s, tenant_id=tenant_a, label="T-A")
+    base = datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC)
+    clip_a = await _seed_clip(
+        s, tenant_id=tenant_a, truck_id=truck_a.id, driver_id=None, started_at=base
+    )
+
+    principal_b = _principal(tenant_id=tenant_b)
+    resp = await client.post(
+        f"/clips/{clip_a.id}/audit",
+        json={"action": "clip.play"},
+        headers=_dev_headers(principal_b),
+    )
+    assert resp.status_code == 404, resp.text
+    detail = resp.json().get("detail", "")
+    assert "forbid" not in str(detail).lower()
+
+    # Cross-tenant attempt must not leak an audit row under either tenant.
+    rows = (
+        await s.execute(
+            select(AuditLog).where(AuditLog.target_id == clip_a.id)
+        )
+    ).scalars().all()
+    assert rows == []

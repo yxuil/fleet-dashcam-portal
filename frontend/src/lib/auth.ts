@@ -98,12 +98,36 @@ function safeLocalStorage(): Storage | null {
   }
 }
 
-/** Read the active dev user from localStorage, with a sane default. */
+/** Read the active dev user from localStorage, with a sane default.
+ *
+ * Self-heals stale selections: if the stored `user_id` no longer matches
+ * any entry in `DEV_USERS` (e.g. the seed was simplified and a tenant
+ * was dropped), we clear the stale keys and fall back to the default.
+ * Without this, a browser that selected Northwind before the shrink to
+ * a single-tenant demo would keep sending dev headers for a tenant
+ * with zero seeded data, silently rendering an empty Fleet Cam page.
+ */
 export function getDevSelection(): { user_id: string; tenant_id: string } {
   const ls = safeLocalStorage();
-  const user_id = ls?.getItem(STORAGE_USER_KEY) ?? DEFAULT_DEV_USER.user_id;
-  const tenant_id = ls?.getItem(STORAGE_TENANT_KEY) ?? DEFAULT_DEV_USER.tenant_id;
-  return { user_id, tenant_id };
+  const stored_user_id = ls?.getItem(STORAGE_USER_KEY) ?? null;
+  const stored_tenant_id = ls?.getItem(STORAGE_TENANT_KEY) ?? null;
+
+  const isStaleSelection =
+    stored_user_id !== null &&
+    !DEV_USERS.some((u) => u.user_id === stored_user_id);
+  if (isStaleSelection) {
+    ls?.removeItem(STORAGE_USER_KEY);
+    ls?.removeItem(STORAGE_TENANT_KEY);
+    return {
+      user_id: DEFAULT_DEV_USER.user_id,
+      tenant_id: DEFAULT_DEV_USER.tenant_id,
+    };
+  }
+
+  return {
+    user_id: stored_user_id ?? DEFAULT_DEV_USER.user_id,
+    tenant_id: stored_tenant_id ?? DEFAULT_DEV_USER.tenant_id,
+  };
 }
 
 /**

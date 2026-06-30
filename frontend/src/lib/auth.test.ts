@@ -19,15 +19,20 @@ describe("auth helpers", () => {
   it("returns X-Dev-* headers when dev mode and selection are set", async () => {
     vi.stubEnv("VITE_APP_ENV", "dev");
     const auth = await import("./auth");
-    auth.setDevUser("u-1", "t-1");
+    // Pick the second DEV_USERS entry (viewer) so the test exercises the
+    // selection path rather than the default. The self-heal in
+    // getDevSelection() will discard arbitrary UUIDs not in DEV_USERS, so
+    // a real entry is required here.
+    const viewer = auth.DEV_USERS[1];
+    auth.setDevUser(viewer.user_id, viewer.tenant_id);
 
     expect(auth.getDevHeaders()).toEqual({
-      "X-Dev-User-Id": "u-1",
-      "X-Dev-Tenant-Id": "t-1",
+      "X-Dev-User-Id": viewer.user_id,
+      "X-Dev-Tenant-Id": viewer.tenant_id,
     });
     expect(auth.getAuthHeaders()).toEqual({
-      "X-Dev-User-Id": "u-1",
-      "X-Dev-Tenant-Id": "t-1",
+      "X-Dev-User-Id": viewer.user_id,
+      "X-Dev-Tenant-Id": viewer.tenant_id,
     });
   });
 
@@ -64,6 +69,30 @@ describe("auth helpers", () => {
     expect(handler).toHaveBeenCalledTimes(1);
 
     window.removeEventListener("auth:dev-user-changed", handler);
+  });
+
+  it("self-heals when localStorage holds a user_id that's no longer in DEV_USERS", async () => {
+    // Simulate the post-T18b scenario: a browser persisted the old
+    // Northwind admin selection before the seed was shrunk to Acme only.
+    localStorage.setItem(
+      "dashcam.dev_user",
+      "35a98177-6209-56fd-b029-d13da11a5ffc",
+    );
+    localStorage.setItem(
+      "dashcam.dev_tenant",
+      "9b8edf70-4582-586b-9627-768850412a8b",
+    );
+
+    vi.stubEnv("VITE_APP_ENV", "dev");
+    const auth = await import("./auth");
+
+    const headers = auth.getDevHeaders();
+    // Stale selection should be replaced with the default (Acme admin).
+    expect(headers["X-Dev-User-Id"]).toBe(auth.DEV_USERS[0].user_id);
+    expect(headers["X-Dev-Tenant-Id"]).toBe(auth.DEV_USERS[0].tenant_id);
+    // …and the stale keys should be cleared so we don't reheal every call.
+    expect(localStorage.getItem("dashcam.dev_user")).toBeNull();
+    expect(localStorage.getItem("dashcam.dev_tenant")).toBeNull();
   });
 
   it("getTenantName resolves seeded tenant IDs to display names", async () => {

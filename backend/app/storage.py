@@ -27,6 +27,7 @@ Boto3 is synchronous; we wrap blocking calls in
 
 from __future__ import annotations
 
+import time
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -35,6 +36,7 @@ from uuid import UUID
 
 import anyio.to_thread
 import boto3
+import jwt
 from botocore.client import Config
 from botocore.exceptions import ClientError
 
@@ -262,9 +264,45 @@ async def get_signed_url(
     return await anyio.to_thread.run_sync(_get_signed_url_sync, key, expires_s)
 
 
+#: Literal ``purpose`` claim placed on local-mode stream tokens. The
+#: ``current_user`` JWT path rejects any token carrying this purpose so a
+#: stream token can never accidentally satisfy session auth.
+STREAM_TOKEN_PURPOSE: str = "clip-stream"
+
+
+def _mint_stream_token(
+    *,
+    user_id: UUID,
+    tenant_id: UUID,
+    clip_id: UUID,
+    expires_s: int,
+) -> str:
+    """Mint an HS256 JWT that authorises a single clip's bytes for ``expires_s``.
+
+    Used only in local mode: cross-origin ``<video>`` elements can't send
+    the dev-headers or ``Authorization`` header, so the token rides in the
+    query string. The token is signed with ``settings.jwt_secret`` (same
+    secret as session JWTs); the stream endpoint verifies the signature,
+    the ``clip_id`` claim against the URL path, and the ``tenant_id`` claim
+    against the loaded clip. The ``purpose`` claim is a defence-in-depth
+    tag so this token can't be replayed as a session JWT.
+    """
+    now = int(time.time())
+    claims = {
+        "sub": str(user_id),
+        "tenant_id": str(tenant_id),
+        "clip_id": str(clip_id),
+        "iat": now,
+        "exp": now + expires_s,
+        "purpose": STREAM_TOKEN_PURPOSE,
+    }
+    return jwt.encode(claims, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+
+
 async def get_playback_url(
     *,
     tenant_id: UUID,
+    user_id: UUID,
     key: str,
     clip_id: UUID,
     expires_s: int = DEFAULT_SIGNED_URL_TTL_S,
@@ -273,10 +311,14 @@ async def get_playback_url(
 
     Mode dispatch:
 
-    * ``local`` → ``"/clips/{clip_id}/stream"`` — a relative route on the
-      backend that serves the file with HTTP Range support. The frontend
-      is responsible for prefixing the API base when it sets ``<video src>``.
-    * ``s3`` → a SigV4 presigned GET URL via :func:`get_signed_url`.
+    * ``local`` → ``"/clips/{clip_id}/stream?t={jwt}"`` — a relative route
+      on the backend that serves the file with HTTP Range support. The
+      ``?t=`` query carries a short-lived HS256 JWT so cross-origin
+      ``<video>`` elements (which can't attach custom auth headers) can
+      authenticate by URL alone. See :func:`_mint_stream_token`.
+    * ``s3`` → a SigV4 presigned GET URL via :func:`get_signed_url`. The
+      ``user_id`` argument is unused in this mode (S3 carries its own
+      signed-URL auth).
 
     The tenant-prefix check still runs in both branches, so a router that
     accidentally passed a cross-tenant key would be refused before the URL
@@ -284,15 +326,32 @@ async def get_playback_url(
 
     Args:
         tenant_id: Caller's tenant; ``key`` must live under this prefix.
+        user_id: Caller's user id — embedded in the local-mode token's
+            ``sub`` claim for audit attribution. Ignored in s3 mode.
         key: Canonical storage key (see :func:`build_clip_key`).
-        clip_id: Clip UUID — used only in local mode to build the route.
-        expires_s: TTL forwarded to :func:`get_signed_url` in s3 mode.
+        clip_id: Clip UUID — used in local mode to build the route and to
+            bind the stream token to a single clip.
+        expires_s: TTL in seconds, in ``(0, MAX_SIGNED_URL_TTL_S]``.
+            Forwarded to :func:`get_signed_url` in s3 mode; used as the
+            token's ``exp`` in local mode.
 
     Raises:
-        ValueError: If ``key`` is not under the caller's tenant prefix
-            (or ``expires_s`` is out of range in s3 mode).
+        ValueError: If ``key`` is not under the caller's tenant prefix, or
+            if ``expires_s`` is out of range.
     """
+    if expires_s <= 0:
+        raise ValueError("expires_s must be positive")
+    if expires_s > MAX_SIGNED_URL_TTL_S:
+        raise ValueError(
+            f"expires_s={expires_s} exceeds MAX_SIGNED_URL_TTL_S={MAX_SIGNED_URL_TTL_S}"
+        )
     _validate_tenant_prefix(tenant_id, key)
     if settings.storage_backend == "local":
-        return f"/clips/{clip_id}/stream"
+        token = _mint_stream_token(
+            user_id=user_id,
+            tenant_id=tenant_id,
+            clip_id=clip_id,
+            expires_s=expires_s,
+        )
+        return f"/clips/{clip_id}/stream?t={token}"
     return await get_signed_url(tenant_id, key, expires_s=expires_s)

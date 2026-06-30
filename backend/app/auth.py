@@ -74,6 +74,13 @@ def _verify_jwt(token: str, cfg: Settings) -> Principal:
     Any failure — bad signature, expired token, missing claims, malformed
     UUIDs — collapses into the generic 401 to avoid leaking which part of
     the token was wrong.
+
+    Defence in depth: tokens carrying a ``purpose`` claim are rejected
+    here. Session JWTs minted upstream don't include a ``purpose``; the
+    only place we set one is :func:`app.storage._mint_stream_token`, which
+    uses ``"clip-stream"`` for the cross-origin ``<video>`` flow. Refusing
+    *any* non-empty ``purpose`` on the session path prevents a stream
+    token from accidentally satisfying ``current_user``.
     """
     try:
         claims = jwt.decode(token, cfg.jwt_secret, algorithms=[cfg.jwt_algorithm])
@@ -81,6 +88,9 @@ def _verify_jwt(token: str, cfg: Settings) -> Principal:
         raise _CREDENTIALS_ERROR from exc
     except jwt.InvalidTokenError as exc:
         raise _CREDENTIALS_ERROR from exc
+
+    if claims.get("purpose"):
+        raise _CREDENTIALS_ERROR
 
     try:
         return Principal(

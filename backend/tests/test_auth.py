@@ -179,6 +179,37 @@ def test_wrong_signature_returns_401() -> None:
     assert excinfo.value.status_code == 401
 
 
+def test_verify_jwt_rejects_stream_purpose_token() -> None:
+    """Defence-in-depth: a token carrying ``purpose=clip-stream`` (minted
+    by ``storage._mint_stream_token``) must NOT satisfy the session JWT
+    path. Otherwise an attacker who steals a stream token from a URL log
+    could replay it against ``/me``, ``/clips``, etc.
+    """
+    cfg = _settings_for()
+    # Same shape as a session JWT, but with a ``purpose`` claim added.
+    token, _ = _make_token(extra={"purpose": "clip-stream"})
+
+    with pytest.raises(HTTPException) as excinfo:
+        _verify_jwt(token, cfg)
+
+    assert excinfo.value.status_code == 401
+    assert "invalid or missing credentials" in str(excinfo.value.detail)
+
+
+def test_verify_jwt_rejects_any_purpose_token() -> None:
+    """Defence-in-depth is broad: ANY non-empty ``purpose`` is refused, so
+    future purpose-tagged tokens (e.g. case export) can't double as session
+    JWTs either. Session JWTs minted upstream don't carry ``purpose``.
+    """
+    cfg = _settings_for()
+    token, _ = _make_token(extra={"purpose": "case-export"})
+
+    with pytest.raises(HTTPException) as excinfo:
+        _verify_jwt(token, cfg)
+
+    assert excinfo.value.status_code == 401
+
+
 # ---------------------------------------------------------------------------
 # Integration tests against GET /me
 # ---------------------------------------------------------------------------

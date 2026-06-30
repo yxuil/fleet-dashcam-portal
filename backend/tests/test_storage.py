@@ -20,6 +20,7 @@ from urllib.parse import urlparse
 from uuid import UUID, uuid4
 
 import httpx
+import jwt
 import pytest
 
 from app import storage as storage_module
@@ -27,6 +28,7 @@ from app.config import settings
 from app.storage import (
     DEFAULT_SIGNED_URL_TTL_S,
     MAX_SIGNED_URL_TTL_S,
+    STREAM_TOKEN_PURPOSE,
     _validate_tenant_prefix,
     build_clip_key,
     ensure_bucket,
@@ -264,18 +266,63 @@ async def test_local_ensure_bucket_creates_directory(
 
 
 @pytest.mark.asyncio
-async def test_get_playback_url_local_mode_returns_stream_route(
+async def test_get_playback_url_local_mode_returns_stream_route_with_token(
     local_storage_root: Path,
 ) -> None:
-    """Local-mode playback URL is the relative router path; no signing."""
+    """Local-mode playback URL embeds a short-lived signed token in ``?t=``.
+
+    The cross-origin ``<video>`` element can't attach the dev-headers or
+    a Bearer token, so the URL itself carries the credential. The token
+    is the JWT minted by :func:`app.storage._mint_stream_token`.
+    """
     tenant_id = uuid4()
+    user_id = uuid4()
     clip_id = uuid4()
     key = build_clip_key(
         tenant_id, datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC), clip_id
     )
 
-    url = await get_playback_url(tenant_id=tenant_id, key=key, clip_id=clip_id)
-    assert url == f"/clips/{clip_id}/stream"
+    url = await get_playback_url(
+        tenant_id=tenant_id, user_id=user_id, key=key, clip_id=clip_id
+    )
+
+    # URL shape: /clips/{clip_id}/stream?t=<jwt>
+    assert url.startswith(f"/clips/{clip_id}/stream?t=")
+    token = url.split("?t=", 1)[1]
+    # Token must be a non-empty string with three dot-separated segments.
+    assert token.count(".") == 2
+
+
+@pytest.mark.asyncio
+async def test_get_playback_url_local_mode_token_carries_expected_claims(
+    local_storage_root: Path,
+) -> None:
+    """Decoding the minted token round-trips ``sub``/``tenant_id``/``clip_id``/``purpose``."""
+    tenant_id = uuid4()
+    user_id = uuid4()
+    clip_id = uuid4()
+    key = build_clip_key(
+        tenant_id, datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC), clip_id
+    )
+
+    url = await get_playback_url(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        key=key,
+        clip_id=clip_id,
+        expires_s=600,
+    )
+    token = url.split("?t=", 1)[1]
+
+    claims = jwt.decode(
+        token, settings.jwt_secret, algorithms=[settings.jwt_algorithm]
+    )
+    assert claims["sub"] == str(user_id)
+    assert claims["tenant_id"] == str(tenant_id)
+    assert claims["clip_id"] == str(clip_id)
+    assert claims["purpose"] == STREAM_TOKEN_PURPOSE
+    # exp must lie within (iat, iat + expires_s] — i.e. exp - iat == 600.
+    assert claims["exp"] - claims["iat"] == 600
 
 
 @pytest.mark.asyncio
@@ -284,11 +331,55 @@ async def test_get_playback_url_local_mode_rejects_cross_tenant(
 ) -> None:
     """Cross-tenant prefix is still rejected even though local mode doesn't sign."""
     tenant_a = uuid4()
+    user_id = uuid4()
     tenant_b = uuid4()
     clip_id = uuid4()
     key_for_b = f"{tenant_b}/2026/06/29/{clip_id}.mp4"
     with pytest.raises(ValueError, match="does not belong to caller's tenant"):
-        await get_playback_url(tenant_id=tenant_a, key=key_for_b, clip_id=clip_id)
+        await get_playback_url(
+            tenant_id=tenant_a, user_id=user_id, key=key_for_b, clip_id=clip_id
+        )
+
+
+@pytest.mark.asyncio
+async def test_get_playback_url_rejects_ttl_above_max(
+    local_storage_root: Path,
+) -> None:
+    """Local mode validates the TTL cap before minting, mirroring s3 mode."""
+    tenant_id = uuid4()
+    user_id = uuid4()
+    clip_id = uuid4()
+    key = build_clip_key(
+        tenant_id, datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC), clip_id
+    )
+    with pytest.raises(ValueError, match="exceeds MAX_SIGNED_URL_TTL_S"):
+        await get_playback_url(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            key=key,
+            clip_id=clip_id,
+            expires_s=MAX_SIGNED_URL_TTL_S + 1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_get_playback_url_rejects_zero_ttl(
+    local_storage_root: Path,
+) -> None:
+    tenant_id = uuid4()
+    user_id = uuid4()
+    clip_id = uuid4()
+    key = build_clip_key(
+        tenant_id, datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC), clip_id
+    )
+    with pytest.raises(ValueError, match="must be positive"):
+        await get_playback_url(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            key=key,
+            clip_id=clip_id,
+            expires_s=0,
+        )
 
 
 @pytest.mark.asyncio
@@ -312,13 +403,18 @@ async def test_get_playback_url_s3_mode_delegates_to_signed_url(
     monkeypatch.setattr(storage_module, "get_signed_url", fake_signed)
 
     tenant_id = uuid4()
+    user_id = uuid4()
     clip_id = uuid4()
     key = build_clip_key(
         tenant_id, datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC), clip_id
     )
 
     url = await get_playback_url(
-        tenant_id=tenant_id, key=key, clip_id=clip_id, expires_s=123
+        tenant_id=tenant_id,
+        user_id=user_id,
+        key=key,
+        clip_id=clip_id,
+        expires_s=123,
     )
 
     assert url == sentinel

@@ -20,11 +20,13 @@ need a live MinIO to test the play-URL path.
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime, timedelta
 
 import httpx
+import jwt
 import pytest
 import pytest_asyncio
 from sqlalchemy import select
@@ -612,7 +614,10 @@ async def test_get_clip_play_true_returns_stream_route_in_local_mode(
     )
     assert resp.status_code == 200, resp.text
     detail = ClipDetail.model_validate(resp.json())
-    assert detail.playback_url == f"/clips/{clip.id}/stream"
+    # Local-mode URL is the relative stream route plus a short-lived
+    # ``?t=<jwt>`` for cross-origin <video> auth.
+    assert detail.playback_url is not None
+    assert detail.playback_url.startswith(f"/clips/{clip.id}/stream?t=")
 
     # Audit row must exist with the documented action / target / payload.
     audit_rows = (
@@ -1052,3 +1057,307 @@ async def test_post_clip_audit_cross_tenant_returns_404(
         )
     ).scalars().all()
     assert rows == []
+
+
+# ---------------------------------------------------------------------------
+# Tests — GET /clips/{id}/stream ``?t=<jwt>`` signed-token path (T19)
+# ---------------------------------------------------------------------------
+
+
+def _make_stream_token(
+    *,
+    secret: str | None = None,
+    user_id: uuid.UUID | None = None,
+    tenant_id: uuid.UUID | None = None,
+    clip_id: uuid.UUID | None = None,
+    purpose: str | None = "clip-stream",
+    exp_delta_s: int = 60,
+) -> str:
+    """Build a stream-style JWT matching ``app.storage._mint_stream_token``.
+
+    Defaults match the happy path. Callers override individual fields to
+    construct the various rejection cases.
+    """
+    now = int(time.time())
+    claims: dict[str, object] = {
+        "sub": str(user_id or uuid.uuid4()),
+        "tenant_id": str(tenant_id or uuid.uuid4()),
+        "clip_id": str(clip_id or uuid.uuid4()),
+        "iat": now,
+        "exp": now + exp_delta_s,
+    }
+    if purpose is not None:
+        claims["purpose"] = purpose
+    return jwt.encode(
+        claims,
+        secret if secret is not None else settings.jwt_secret,
+        algorithm=settings.jwt_algorithm,
+    )
+
+
+@pytest.mark.asyncio
+async def test_stream_endpoint_accepts_signed_token_in_query(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """A valid ``?t=<jwt>`` authenticates without any dev/Bearer headers."""
+    client, s = http_client_with_session
+
+    monkeypatch.setattr(settings, "storage_backend", "local")
+    monkeypatch.setattr(settings, "storage_root", tmp_path)
+
+    tenant = uuid.uuid4()
+    user = uuid.uuid4()
+    await _seed_tenant(s, tenant)
+    truck = await _seed_truck(s, tenant_id=tenant, label="T-tok")
+    base = datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC)
+    clip = await _seed_clip(
+        s, tenant_id=tenant, truck_id=truck.id, driver_id=None, started_at=base
+    )
+    payload = b"\xde\xad\xbe\xef-tokened-bytes"
+    await storage_module.put_object(tenant, clip.storage_key, payload)
+
+    token = _make_stream_token(
+        user_id=user, tenant_id=tenant, clip_id=clip.id
+    )
+    # Crucially: no dev headers, no Bearer — the token alone must work.
+    resp = await client.get(f"/clips/{clip.id}/stream", params={"t": token})
+    assert resp.status_code == 200, resp.text
+    assert resp.headers.get("content-type") == "video/mp4"
+    assert resp.content == payload
+
+
+@pytest.mark.asyncio
+async def test_stream_endpoint_rejects_expired_token(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    client, s = http_client_with_session
+
+    monkeypatch.setattr(settings, "storage_backend", "local")
+    monkeypatch.setattr(settings, "storage_root", tmp_path)
+
+    tenant = uuid.uuid4()
+    await _seed_tenant(s, tenant)
+    truck = await _seed_truck(s, tenant_id=tenant, label="T-exp")
+    base = datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC)
+    clip = await _seed_clip(
+        s, tenant_id=tenant, truck_id=truck.id, driver_id=None, started_at=base
+    )
+    await storage_module.put_object(tenant, clip.storage_key, b"x")
+
+    token = _make_stream_token(
+        tenant_id=tenant, clip_id=clip.id, exp_delta_s=-30
+    )
+    resp = await client.get(f"/clips/{clip.id}/stream", params={"t": token})
+    assert resp.status_code == 401, resp.text
+    assert resp.json()["detail"] == "invalid or missing credentials"
+
+
+@pytest.mark.asyncio
+async def test_stream_endpoint_rejects_token_signed_with_wrong_secret(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    client, s = http_client_with_session
+
+    monkeypatch.setattr(settings, "storage_backend", "local")
+    monkeypatch.setattr(settings, "storage_root", tmp_path)
+
+    tenant = uuid.uuid4()
+    await _seed_tenant(s, tenant)
+    truck = await _seed_truck(s, tenant_id=tenant, label="T-bad-sig")
+    base = datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC)
+    clip = await _seed_clip(
+        s, tenant_id=tenant, truck_id=truck.id, driver_id=None, started_at=base
+    )
+    await storage_module.put_object(tenant, clip.storage_key, b"x")
+
+    token = _make_stream_token(
+        secret="attacker-secret",  # noqa: S106 - test fixture
+        tenant_id=tenant,
+        clip_id=clip.id,
+    )
+    resp = await client.get(f"/clips/{clip.id}/stream", params={"t": token})
+    assert resp.status_code == 401, resp.text
+
+
+@pytest.mark.asyncio
+async def test_stream_endpoint_rejects_token_for_different_clip_id(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """A token minted for clip A must NOT unlock clip B's bytes."""
+    client, s = http_client_with_session
+
+    monkeypatch.setattr(settings, "storage_backend", "local")
+    monkeypatch.setattr(settings, "storage_root", tmp_path)
+
+    tenant = uuid.uuid4()
+    await _seed_tenant(s, tenant)
+    truck = await _seed_truck(s, tenant_id=tenant, label="T-swap")
+    base = datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC)
+    clip_a = await _seed_clip(
+        s, tenant_id=tenant, truck_id=truck.id, driver_id=None, started_at=base
+    )
+    clip_b = await _seed_clip(
+        s,
+        tenant_id=tenant,
+        truck_id=truck.id,
+        driver_id=None,
+        started_at=base + timedelta(minutes=1),
+    )
+    await storage_module.put_object(tenant, clip_a.storage_key, b"a")
+    await storage_module.put_object(tenant, clip_b.storage_key, b"b")
+
+    # Token issued for clip A — replay against clip B's path.
+    token = _make_stream_token(tenant_id=tenant, clip_id=clip_a.id)
+    resp = await client.get(f"/clips/{clip_b.id}/stream", params={"t": token})
+    assert resp.status_code == 401, resp.text
+
+
+@pytest.mark.asyncio
+async def test_stream_endpoint_rejects_token_for_different_tenant_id(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """Token claims tenant B; clip lives under tenant A → 404 (cross-tenant)."""
+    client, s = http_client_with_session
+
+    monkeypatch.setattr(settings, "storage_backend", "local")
+    monkeypatch.setattr(settings, "storage_root", tmp_path)
+
+    tenant_a = uuid.uuid4()
+    tenant_b = uuid.uuid4()
+    await _seed_tenant(s, tenant_a)
+    await _seed_tenant(s, tenant_b)
+
+    truck_a = await _seed_truck(s, tenant_id=tenant_a, label="T-A-tenant")
+    base = datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC)
+    clip_a = await _seed_clip(
+        s, tenant_id=tenant_a, truck_id=truck_a.id, driver_id=None, started_at=base
+    )
+    await storage_module.put_object(tenant_a, clip_a.storage_key, b"a-only")
+
+    # Forge a token claiming clip_a is owned by tenant_b. The signature is
+    # valid (same secret) but the SQL ``WHERE tenant_id=...`` will fail to
+    # locate the row → 404, not 200.
+    token = _make_stream_token(tenant_id=tenant_b, clip_id=clip_a.id)
+    resp = await client.get(f"/clips/{clip_a.id}/stream", params={"t": token})
+    assert resp.status_code == 404, resp.text
+    detail = resp.json().get("detail", "")
+    assert "forbid" not in str(detail).lower()
+
+
+@pytest.mark.asyncio
+async def test_stream_endpoint_rejects_token_with_wrong_purpose(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """A correctly-signed JWT without ``purpose=clip-stream`` is refused."""
+    client, s = http_client_with_session
+
+    monkeypatch.setattr(settings, "storage_backend", "local")
+    monkeypatch.setattr(settings, "storage_root", tmp_path)
+
+    tenant = uuid.uuid4()
+    await _seed_tenant(s, tenant)
+    truck = await _seed_truck(s, tenant_id=tenant, label="T-purp")
+    base = datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC)
+    clip = await _seed_clip(
+        s, tenant_id=tenant, truck_id=truck.id, driver_id=None, started_at=base
+    )
+    await storage_module.put_object(tenant, clip.storage_key, b"x")
+
+    # No ``purpose`` claim at all (i.e. a session JWT that wandered in).
+    no_purpose = _make_stream_token(
+        tenant_id=tenant, clip_id=clip.id, purpose=None
+    )
+    resp = await client.get(f"/clips/{clip.id}/stream", params={"t": no_purpose})
+    assert resp.status_code == 401, resp.text
+
+    # Wrong ``purpose`` string.
+    wrong_purpose = _make_stream_token(
+        tenant_id=tenant, clip_id=clip.id, purpose="case-export"
+    )
+    resp = await client.get(f"/clips/{clip.id}/stream", params={"t": wrong_purpose})
+    assert resp.status_code == 401, resp.text
+
+
+@pytest.mark.asyncio
+async def test_stream_endpoint_still_accepts_auth_header_without_token(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """The dev-headers fallback must keep working — curl + dev headers ops/debug."""
+    client, s = http_client_with_session
+
+    monkeypatch.setattr(settings, "storage_backend", "local")
+    monkeypatch.setattr(settings, "storage_root", tmp_path)
+
+    tenant = uuid.uuid4()
+    await _seed_tenant(s, tenant)
+    truck = await _seed_truck(s, tenant_id=tenant, label="T-fallback")
+    base = datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC)
+    clip = await _seed_clip(
+        s, tenant_id=tenant, truck_id=truck.id, driver_id=None, started_at=base
+    )
+    payload = b"header-auth-ok"
+    await storage_module.put_object(tenant, clip.storage_key, payload)
+
+    principal = _principal(tenant_id=tenant)
+    # No ``?t=`` — only dev headers, like an ops curl session.
+    resp = await client.get(
+        f"/clips/{clip.id}/stream",
+        headers=_dev_headers(principal),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.content == payload
+
+
+@pytest.mark.asyncio
+async def test_stream_endpoint_rejects_garbage_token(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """A bogus ``?t=`` value short-circuits to 401 — it doesn't fall through to dev-headers."""
+    client, s = http_client_with_session
+
+    monkeypatch.setattr(settings, "storage_backend", "local")
+    monkeypatch.setattr(settings, "storage_root", tmp_path)
+
+    tenant = uuid.uuid4()
+    await _seed_tenant(s, tenant)
+    truck = await _seed_truck(s, tenant_id=tenant, label="T-garbage")
+    base = datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC)
+    clip = await _seed_clip(
+        s, tenant_id=tenant, truck_id=truck.id, driver_id=None, started_at=base
+    )
+    await storage_module.put_object(tenant, clip.storage_key, b"x")
+
+    principal = _principal(tenant_id=tenant)
+    # Even WITH valid dev headers, a present-but-broken token must 401:
+    # a request can't be authenticated by an invalid credential just
+    # because a different valid credential happens to be present.
+    resp = await client.get(
+        f"/clips/{clip.id}/stream",
+        params={"t": "garbage"},
+        headers=_dev_headers(principal),
+    )
+    assert resp.status_code == 401, resp.text

@@ -44,22 +44,34 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+import jwt
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse
+from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.audit import record as audit_record
-from app.auth import Principal, current_user
-from app.config import settings
+from app.auth import Principal, current_user, get_settings
+from app.config import Settings, settings
 from app.db import get_session
 from app.models.clip import Clip
 from app.models.driver import Driver
 from app.models.truck import Truck
 from app.schemas.clip import ClipDetail, ClipListResponse, ClipRow
-from app.storage import DEFAULT_SIGNED_URL_TTL_S, get_playback_url
+from app.storage import (
+    DEFAULT_SIGNED_URL_TTL_S,
+    STREAM_TOKEN_PURPOSE,
+    get_playback_url,
+)
+
+_STREAM_CREDENTIALS_ERROR = HTTPException(
+    status_code=status.HTTP_401_UNAUTHORIZED,
+    detail="invalid or missing credentials",
+    headers={"WWW-Authenticate": "Bearer"},
+)
 
 router = APIRouter(tags=["clips"])
 
@@ -236,6 +248,7 @@ async def get_clip(
         )
         url = await get_playback_url(
             tenant_id=principal.tenant_id,
+            user_id=principal.user_id,
             key=clip.storage_key,
             clip_id=clip.id,
             expires_s=DEFAULT_SIGNED_URL_TTL_S,
@@ -252,11 +265,55 @@ async def get_clip(
 # ---------------------------------------------------------------------------
 
 
+def _verify_stream_token(token: str, clip_id: UUID, cfg: Settings) -> Principal:
+    """Decode a ``?t=`` stream token and bind it to ``clip_id``.
+
+    Validates: HS256 signature against ``cfg.jwt_secret``, expiry,
+    ``purpose == "clip-stream"`` (defence-in-depth so a stream token can't
+    impersonate a session JWT), and the ``clip_id`` claim against the URL
+    path. The ``tenant_id`` claim is propagated into the returned
+    :class:`Principal`; the SQL ``WHERE`` on ``tenant_id`` then enforces
+    that the loaded clip actually belongs to the token's tenant. Any
+    failure raises the same neutral 401 used elsewhere.
+    """
+    try:
+        claims = jwt.decode(token, cfg.jwt_secret, algorithms=[cfg.jwt_algorithm])
+    except jwt.ExpiredSignatureError as exc:
+        raise _STREAM_CREDENTIALS_ERROR from exc
+    except jwt.InvalidTokenError as exc:
+        raise _STREAM_CREDENTIALS_ERROR from exc
+
+    if claims.get("purpose") != STREAM_TOKEN_PURPOSE:
+        raise _STREAM_CREDENTIALS_ERROR
+
+    try:
+        claim_clip = UUID(claims["clip_id"])
+        claim_tenant = UUID(claims["tenant_id"])
+        claim_user = UUID(claims["sub"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise _STREAM_CREDENTIALS_ERROR from exc
+
+    if claim_clip != clip_id:
+        raise _STREAM_CREDENTIALS_ERROR
+
+    # Build a minimal Principal. ``roles``, ``email``, ``name`` aren't
+    # consulted by the stream endpoint; the load-by-tenant SQL is the
+    # actual authz check.
+    return Principal(
+        user_id=claim_user,
+        tenant_id=claim_tenant,
+        roles=[],
+        email="",
+        name="",
+    )
+
+
 @router.get("/clips/{clip_id}/stream")
 async def stream_clip(
     clip_id: UUID,
-    principal: Annotated[Principal, Depends(current_user)],
+    request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
+    cfg: Annotated[Settings, Depends(get_settings)],
 ) -> FileResponse:
     """Stream a clip's MP4 bytes from the local filesystem.
 
@@ -264,6 +321,16 @@ async def stream_clip(
     Tenant scoping happens twice: once via the SQL ``WHERE`` (so a clip
     belonging to another tenant returns 404), and again as a defence-in-depth
     path-traversal check after resolving the on-disk path.
+
+    Two credential paths are accepted:
+
+    * **``?t=<jwt>``** — short-lived HS256 token minted by
+      :func:`app.storage._mint_stream_token`. This is what cross-origin
+      ``<video>`` elements use, because the browser won't attach the
+      ``Authorization`` / ``X-Dev-*`` headers on a media fetch.
+    * **No ``?t=``** — falls back to :func:`app.auth.current_user`
+      (Bearer JWT or dev headers). Curl + dev headers keeps working for
+      ops/debug.
 
     No audit row is written here — the browser may issue many HTTP Range
     requests per playback, and ``clip.play_url_minted`` (written by the
@@ -277,6 +344,24 @@ async def stream_clip(
         requests natively, which is what the ``<video>`` element needs
         to scrub.
     """
+    token = request.query_params.get("t")
+    if token:
+        principal = _verify_stream_token(token, clip_id, cfg)
+    else:
+        # Manual delegation to the dependency: we want either credential
+        # to work, so we can't list ``current_user`` as a hard ``Depends``
+        # without breaking the token-only path. Reconstruct the Bearer
+        # credentials from the raw header so curl + JWT keeps working.
+        auth_header = request.headers.get("Authorization") or ""
+        credentials: HTTPAuthorizationCredentials | None = None
+        if auth_header.lower().startswith("bearer "):
+            credentials = HTTPAuthorizationCredentials(
+                scheme="Bearer", credentials=auth_header[7:].strip()
+            )
+        principal = current_user(
+            request=request, credentials=credentials, cfg=cfg
+        )
+
     stmt = select(Clip).where(
         Clip.id == clip_id, Clip.tenant_id == principal.tenant_id
     )

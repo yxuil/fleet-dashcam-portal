@@ -295,6 +295,8 @@ The backend's `current_user` dep accepts those headers **only when `APP_ENV=dev`
 
 **This is the only thing standing between you and a "set X-Dev-Tenant-Id to win" production vulnerability.** When you deploy, set `APP_ENV=prod` explicitly. Don't rely on the default.
 
+**One exception to the headers-everywhere rule: the local-mode stream endpoint.** `GET /clips/{id}/stream` also accepts a short-lived signed token in `?t=<jwt>`. The browser's `<video>` element fetches the URL cross-origin (`:5173` → `:8000`) and does *not* attach the dev-headers or any `Authorization` header on media fetches, so the token rides in the URL itself. It's HS256-signed with `settings.jwt_secret` (same secret as session JWTs), carries `purpose="clip-stream"` plus a `clip_id` bound to the path, and expires in `DEFAULT_SIGNED_URL_TTL_S` (1h). The endpoint still accepts the dev-headers / `Authorization` when no `?t=` is present, so curl-based ops/debug keeps working. See `storage._mint_stream_token` and `routers/clips._verify_stream_token`.
+
 ---
 
 ## 5. Three end-to-end walkthroughs
@@ -309,8 +311,8 @@ Trace these in the actual code with the file open. They will teach you more than
 4. Each `TruckRow` calls `useTruckDays(truck.id, filters)` → `GET /trucks/{id}/days`. Backend handler: `backend/app/routers/trucks.py::list_truck_days`, which groups clips by `date_trunc('day', started_at)` and returns one representative `first_clip_id` per day.
 5. The user clicks a `<DayCard>` → `navigate(\`/clips/${first_clip_id}\`)`.
 6. `ClipPage.tsx` mounts. `useClipDetail(id)` fires `GET /clips/{id}?play=true`.
-7. Backend: `clips.py::get_clip` loads the clip (tenant-scoped 404), calls `audit_record(... action="clip.play_url_minted" ...)`, calls `storage.get_playback_url(tenant_id=..., key=storage_key, clip_id=...)` (which re-verifies the tenant prefix and dispatches on `STORAGE_BACKEND`), commits, returns `ClipDetail` with `playback_url`.
-8. The page sets `<video src={playback_url}>` (the frontend prefixes a relative URL with `API_BASE`). In local mode the browser fetches `GET /clips/{id}/stream` from the backend; in s3 mode it fetches the presigned URL from MinIO directly. Either way the bytes flow back over HTTP Range requests.
+7. Backend: `clips.py::get_clip` loads the clip (tenant-scoped 404), calls `audit_record(... action="clip.play_url_minted" ...)`, calls `storage.get_playback_url(tenant_id=..., user_id=..., key=storage_key, clip_id=...)` (which re-verifies the tenant prefix and dispatches on `STORAGE_BACKEND`), commits, returns `ClipDetail` with `playback_url`.
+8. The page sets `<video src={playback_url}>` (the frontend prefixes a relative URL with `API_BASE`). In local mode the URL is `/clips/{id}/stream?t=<jwt>` — the token authenticates the cross-origin `<video>` fetch (see §4.6) — and the browser fetches the bytes from the backend. In s3 mode the URL is a presigned S3 GET URL and the browser fetches from MinIO directly. Either way the bytes flow back over HTTP Range requests.
 9. On mount, the page also calls `useAuditEmitter`'s `emitPlay()`, which POSTs `/clips/{id}/audit` — a different audit row marking "user actually started playback" vs "URL minted".
 10. On unmount: `emitClosed({ view_duration_s })` fires.
 
@@ -421,7 +423,7 @@ In rough order of "how badly will this hurt if you break it":
 3. **Honest 404s.** See §4.1 and §5.3. `"not found"` is the only string used for "you can't see this." Any other wording is a leak.
 4. **Dev-mode gating.** See §4.6. `APP_ENV=prod` in production. No exceptions.
 5. **No client-asserted tenant on `/ingest/clips`** *yet* — this is a known issue. The ingest stub trusts its caller. When you add a real ingest pipeline, the first thing to ship is HMAC-signed service-to-service auth so callers can't lie about tenant_id. Until then, that endpoint should be reachable only from an internal network.
-6. **Signed URL TTL cap.** See `storage.MAX_SIGNED_URL_TTL_S = 6 * 3600`. If you raise it, you raise the blast radius of a leaked URL. Get sign-off.
+6. **Signed URL TTL cap.** See `storage.MAX_SIGNED_URL_TTL_S = 6 * 3600`. If you raise it, you raise the blast radius of a leaked URL. Get sign-off. This cap applies to both modes: S3 presigned URLs *and* the local-mode `?t=<jwt>` stream tokens (`storage._mint_stream_token`). The token is signed with `settings.jwt_secret`, carries `purpose="clip-stream"` so it can never accidentally satisfy `current_user` (the session JWT path explicitly rejects any token with a non-empty `purpose`), and is bound to a specific `clip_id`. The token ends up in browser history and any access logs — that's the documented tradeoff for cross-origin `<video>` playback; the short TTL keeps the blast radius small.
 7. **CORS.** Currently `["http://localhost:5173"]` — explicit, not `*`. When you deploy, set it to your production origin. Never widen for convenience.
 8. **No secrets in the repo.** `.env.example` ships placeholder values. The real values live in your secrets manager.
 

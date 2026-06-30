@@ -347,7 +347,7 @@ function Header({ detail }: { detail: ClipDetail }) {
         className="text-xs text-muted-foreground underline-offset-2 hover:underline"
         data-testid="back-to-search"
       >
-        ← Back to search
+        ← Back
       </Link>
       <div className="flex items-baseline justify-between">
         <h1
@@ -521,7 +521,7 @@ function NotFoundState() {
         to="/search"
         className="text-sm text-primary underline-offset-2 hover:underline"
       >
-        ← Back to search
+        ← Back
       </Link>
     </div>
   );

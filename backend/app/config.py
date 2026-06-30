@@ -36,5 +36,12 @@ class Settings(BaseSettings):
     s3_bucket: str = "dashcam-clips"
     s3_region: str = "us-east-1"
 
+    # Maximum allowed size, in bytes, for an upload through
+    # ``POST /clips/upload``. Default 1 GiB — large enough for a few minutes
+    # of dashcam footage, small enough that a single multipart request
+    # doesn't tie up the worker indefinitely. Exceeding this returns
+    # ``413 Payload Too Large`` without leaving partial bytes on disk.
+    max_upload_bytes: int = 1_073_741_824
+
 
 settings = Settings()

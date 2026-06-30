@@ -381,6 +381,15 @@ Add a scenario to `frontend/tests/e2e/smoke.spec.ts` if the feature crosses majo
 
 If you introduce a new pattern (rare), update this doc. If you only follow existing patterns, just update the API list in `README.md`.
 
+### Worked example: the upload modal (T20)
+
+The most recent feature that exercises this recipe end-to-end is the browser upload modal on Fleet Cam:
+
+- **Backend**: `POST /clips/upload` (multipart) in `backend/app/routers/clips.py`. Validates `truck_id` / `driver_id` against the caller's tenant, enforces `settings.max_upload_bytes`, hashes the body with SHA-256, writes through `storage.put_object`, inserts the clip row, writes a `clip.uploaded` audit row, commits.
+- **Frontend**: `<UploadModal />` in `frontend/src/components/dashcam/`, fed by `uploadClip()` in `frontend/src/hooks/useUploadClip.ts` (an XHR-based uploader rather than a `useMutation` so we can wire `xhr.upload.onprogress` to a per-file progress bar). On close the modal invalidates `["trucks"]` + `["truck-days"]` so any successful uploads show up as new day cards immediately.
+
+That's the *one* place in the codebase right now that uses XHR instead of `fetch` — see the comment in `useUploadClip.ts` for the rationale.
+
 ### The single rule
 
 If you find yourself writing more than ~200 lines of new code in a single file, stop and ask whether there's a smaller piece you can ship first. The codebase rewards small, additive PRs.
@@ -457,6 +466,7 @@ If you see one of these, **don't "fix" it without asking** — they were scoped 
 | `clip.text` filter treats `%`/`_` as ILIKE wildcards | Known | Either escape user input or document it. UX call. |
 | Dev mode display name is always "Dev User" | Known | `_dev_principal` in `auth.py` returns synthetic name regardless of which seeded user is picked. Fix: look up the user row in `users` table when minting the principal. Trivial, just never got prioritised. |
 | Real ingest pipeline | Not built | The `POST /ingest/clips` endpoint exists as a forward-compat stub. It currently has *no auth*. Top of the v2 list. |
+| Server-side date extraction from MP4 metadata via ffprobe | Not built | The upload modal currently parses recording timestamps from the filename (with `lastModified` fallback) — see `frontend/src/lib/uploadDate.ts`. A backend ffprobe pass over the uploaded bytes would give us a more authoritative `started_at`, but it adds `ffmpeg` to the runtime deps and the filename heuristic is good enough for MVP. |
 
 If you tackle one of these, please:
 

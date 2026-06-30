@@ -1361,3 +1361,309 @@ async def test_stream_endpoint_rejects_garbage_token(
         headers=_dev_headers(principal),
     )
     assert resp.status_code == 401, resp.text
+
+
+# ---------------------------------------------------------------------------
+# Tests — POST /clips/upload (T20, browser upload modal)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_upload_clip_happy_path(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """Happy path: clip row + audit row + file on disk after a multipart POST."""
+    client, s = http_client_with_session
+
+    monkeypatch.setattr(settings, "storage_backend", "local")
+    monkeypatch.setattr(settings, "storage_root", tmp_path)
+
+    tenant = uuid.uuid4()
+    await _seed_tenant(s, tenant)
+    truck = await _seed_truck(s, tenant_id=tenant, label="T-upload")
+    driver = await _seed_driver(s, tenant_id=tenant, name="Up Loader")
+
+    principal = _principal(tenant_id=tenant)
+    payload = b"\xde\xad\xbe\xef" * 32  # 128 bytes of "video"
+    started = datetime(2026, 6, 29, 8, 30, 0, tzinfo=UTC)
+
+    resp = await client.post(
+        "/clips/upload",
+        headers=_dev_headers(principal),
+        data={
+            "truck_id": str(truck.id),
+            "driver_id": str(driver.id),
+            "started_at": started.isoformat(),
+            "duration_s": "30",
+        },
+        files={"file": ("clip.mp4", payload, "video/mp4")},
+    )
+    assert resp.status_code == 200, resp.text
+    detail = ClipDetail.model_validate(resp.json())
+    assert detail.tenant_id == tenant
+    assert detail.truck_id == truck.id
+    assert detail.driver_id == driver.id
+    assert detail.duration_s == 30
+    assert detail.sha256 is not None
+    import hashlib as _h
+
+    assert detail.sha256 == _h.sha256(payload).hexdigest()
+
+    # Clip row materialised under this tenant.
+    clip_row = (
+        await s.execute(select(Clip).where(Clip.id == detail.id))
+    ).scalar_one_or_none()
+    assert clip_row is not None
+    assert clip_row.tenant_id == tenant
+    assert clip_row.storage_key.startswith(f"{tenant}/")
+
+    # File written to local storage under the expected path.
+    on_disk = tmp_path / clip_row.storage_key
+    assert on_disk.exists()
+    assert on_disk.read_bytes() == payload
+
+    # One audit row of action ``clip.uploaded`` for this clip.
+    audit_rows = (
+        await s.execute(
+            select(AuditLog).where(AuditLog.target_id == detail.id)
+        )
+    ).scalars().all()
+    actions = [r.action for r in audit_rows]
+    assert "clip.uploaded" in actions
+
+
+@pytest.mark.asyncio
+async def test_upload_cross_tenant_truck_returns_404(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """A truck from another tenant returns honest 404 — no cross-tenant probe."""
+    client, s = http_client_with_session
+
+    monkeypatch.setattr(settings, "storage_backend", "local")
+    monkeypatch.setattr(settings, "storage_root", tmp_path)
+
+    tenant_a = uuid.uuid4()
+    tenant_b = uuid.uuid4()
+    await _seed_tenant(s, tenant_a)
+    await _seed_tenant(s, tenant_b)
+
+    # Truck owned by tenant B.
+    truck_b = await _seed_truck(s, tenant_id=tenant_b, label="T-foreign")
+
+    principal_a = _principal(tenant_id=tenant_a)
+    started = datetime(2026, 6, 29, 9, 0, 0, tzinfo=UTC)
+    resp = await client.post(
+        "/clips/upload",
+        headers=_dev_headers(principal_a),
+        data={
+            "truck_id": str(truck_b.id),
+            "started_at": started.isoformat(),
+        },
+        files={"file": ("clip.mp4", b"x" * 16, "video/mp4")},
+    )
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["detail"] == "not found"
+
+
+@pytest.mark.asyncio
+async def test_upload_unknown_driver_returns_404(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """A driver from another tenant returns honest 404."""
+    client, s = http_client_with_session
+
+    monkeypatch.setattr(settings, "storage_backend", "local")
+    monkeypatch.setattr(settings, "storage_root", tmp_path)
+
+    tenant_a = uuid.uuid4()
+    tenant_b = uuid.uuid4()
+    await _seed_tenant(s, tenant_a)
+    await _seed_tenant(s, tenant_b)
+
+    truck_a = await _seed_truck(s, tenant_id=tenant_a, label="T-a")
+    # Driver belongs to tenant B, not tenant A.
+    driver_b = await _seed_driver(s, tenant_id=tenant_b, name="Other Tenant Driver")
+
+    principal_a = _principal(tenant_id=tenant_a)
+    started = datetime(2026, 6, 29, 9, 30, 0, tzinfo=UTC)
+    resp = await client.post(
+        "/clips/upload",
+        headers=_dev_headers(principal_a),
+        data={
+            "truck_id": str(truck_a.id),
+            "driver_id": str(driver_b.id),
+            "started_at": started.isoformat(),
+        },
+        files={"file": ("clip.mp4", b"x" * 16, "video/mp4")},
+    )
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["detail"] == "not found"
+
+
+@pytest.mark.asyncio
+async def test_upload_missing_required_fields_returns_422(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """Missing ``truck_id`` / ``started_at`` / ``file`` -> FastAPI 422."""
+    client, _ = http_client_with_session
+
+    monkeypatch.setattr(settings, "storage_backend", "local")
+    monkeypatch.setattr(settings, "storage_root", tmp_path)
+
+    principal = _principal()
+    # No ``truck_id`` field at all.
+    resp = await client.post(
+        "/clips/upload",
+        headers=_dev_headers(principal),
+        data={"started_at": datetime.now(UTC).isoformat()},
+        files={"file": ("clip.mp4", b"x", "video/mp4")},
+    )
+    assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.asyncio
+async def test_upload_exceeds_size_limit_returns_413(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """A body larger than ``max_upload_bytes`` is rejected with 413.
+
+    No partial bytes should be written. We pin the cap low so we don't
+    have to actually allocate a gigabyte of test data.
+    """
+    client, s = http_client_with_session
+
+    monkeypatch.setattr(settings, "storage_backend", "local")
+    monkeypatch.setattr(settings, "storage_root", tmp_path)
+    monkeypatch.setattr(settings, "max_upload_bytes", 64)
+
+    tenant = uuid.uuid4()
+    await _seed_tenant(s, tenant)
+    truck = await _seed_truck(s, tenant_id=tenant, label="T-too-big")
+
+    principal = _principal(tenant_id=tenant)
+    big = b"y" * 128  # twice the cap
+
+    resp = await client.post(
+        "/clips/upload",
+        headers=_dev_headers(principal),
+        data={
+            "truck_id": str(truck.id),
+            "started_at": datetime(2026, 6, 29, 10, 0, 0, tzinfo=UTC).isoformat(),
+        },
+        files={"file": ("big.mp4", big, "video/mp4")},
+    )
+    assert resp.status_code == 413, resp.text
+    assert resp.json()["detail"] == "file too large"
+
+    # No clip row was inserted for this truck.
+    rows = (
+        await s.execute(select(Clip).where(Clip.truck_id == truck.id))
+    ).scalars().all()
+    assert rows == []
+    # No file under storage_root (other than possibly empty tenant tree).
+    files_under_tenant = list((tmp_path / str(tenant)).rglob("*"))
+    # Either the tree doesn't exist at all, or only directories exist.
+    assert all(p.is_dir() for p in files_under_tenant)
+
+
+@pytest.mark.asyncio
+async def test_upload_writes_audit_with_payload(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """The audit row carries the truck/driver/size/source payload."""
+    client, s = http_client_with_session
+
+    monkeypatch.setattr(settings, "storage_backend", "local")
+    monkeypatch.setattr(settings, "storage_root", tmp_path)
+
+    tenant = uuid.uuid4()
+    await _seed_tenant(s, tenant)
+    truck = await _seed_truck(s, tenant_id=tenant, label="T-audit")
+    driver = await _seed_driver(s, tenant_id=tenant, name="Audit Driver")
+
+    principal = _principal(tenant_id=tenant)
+    payload = b"a" * 73
+    started = datetime(2026, 6, 29, 11, 0, 0, tzinfo=UTC)
+    resp = await client.post(
+        "/clips/upload",
+        headers=_dev_headers(principal),
+        data={
+            "truck_id": str(truck.id),
+            "driver_id": str(driver.id),
+            "started_at": started.isoformat(),
+            "duration_s": "12",
+        },
+        files={"file": ("clip.mp4", payload, "video/mp4")},
+    )
+    assert resp.status_code == 200, resp.text
+    clip_id = uuid.UUID(resp.json()["id"])
+
+    audit_rows = (
+        await s.execute(
+            select(AuditLog).where(
+                AuditLog.target_id == clip_id, AuditLog.action == "clip.uploaded"
+            )
+        )
+    ).scalars().all()
+    assert len(audit_rows) == 1
+    row = audit_rows[0]
+    assert row.tenant_id == tenant
+    assert row.target_type == "clip"
+    assert row.payload["truck_id"] == str(truck.id)
+    assert row.payload["driver_id"] == str(driver.id)
+    assert row.payload["file_size_bytes"] == len(payload)
+    assert row.payload["source"] == "web"
+
+
+@pytest.mark.asyncio
+async def test_upload_storage_key_lives_under_tenant_prefix(
+    http_client_with_session: tuple[httpx.AsyncClient, AsyncSession],
+    dev_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """Defence in depth: every uploaded clip's storage_key starts with ``{tenant}/``."""
+    client, s = http_client_with_session
+
+    monkeypatch.setattr(settings, "storage_backend", "local")
+    monkeypatch.setattr(settings, "storage_root", tmp_path)
+
+    tenant = uuid.uuid4()
+    await _seed_tenant(s, tenant)
+    truck = await _seed_truck(s, tenant_id=tenant, label="T-prefix")
+
+    principal = _principal(tenant_id=tenant)
+    started = datetime(2026, 6, 29, 12, 0, 0, tzinfo=UTC)
+    resp = await client.post(
+        "/clips/upload",
+        headers=_dev_headers(principal),
+        data={
+            "truck_id": str(truck.id),
+            "started_at": started.isoformat(),
+        },
+        files={"file": ("clip.mp4", b"k" * 4, "video/mp4")},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["storage_key"].startswith(f"{tenant}/")
+    # Date components in the storage key match ``started_at``.
+    assert "/2026/06/29/" in body["storage_key"]
+    assert body["storage_key"].endswith(f"/{body['id']}.mp4")

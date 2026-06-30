@@ -37,15 +37,26 @@ existence across tenants.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import jwt
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    status,
+)
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
@@ -53,6 +64,7 @@ from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app import storage as storage_module
 from app.audit import record as audit_record
 from app.auth import Principal, current_user, get_settings
 from app.config import Settings, settings
@@ -64,6 +76,7 @@ from app.schemas.clip import ClipDetail, ClipListResponse, ClipRow
 from app.storage import (
     DEFAULT_SIGNED_URL_TTL_S,
     STREAM_TOKEN_PURPOSE,
+    build_clip_key,
     get_playback_url,
 )
 
@@ -199,6 +212,166 @@ async def list_clips(
         items=[ClipRow.model_validate(r) for r in page],
         next_cursor=next_cursor,
     )
+
+
+# ---------------------------------------------------------------------------
+# Upload endpoint (T20)
+# ---------------------------------------------------------------------------
+
+#: Chunk size used when streaming an uploaded file into memory for hashing
+#: and into storage. 1 MiB strikes a balance between syscalls and peak
+#: memory for the upload buffer.
+_UPLOAD_CHUNK_BYTES: int = 1024 * 1024
+
+
+@router.post("/clips/upload", response_model=ClipDetail)
+async def upload_clip(
+    principal: Annotated[Principal, Depends(current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+    truck_id: Annotated[UUID, Form()],
+    started_at: Annotated[datetime, Form()],
+    file: Annotated[UploadFile, File(description="Clip bytes")],
+    driver_id: Annotated[UUID | None, Form()] = None,
+    duration_s: Annotated[int, Form(ge=0)] = 0,
+) -> ClipDetail:
+    """Accept a clip file from the browser upload modal.
+
+    Multipart fields:
+        * ``truck_id``: required UUID — must belong to caller's tenant.
+        * ``driver_id``: optional UUID — must belong to caller's tenant if set.
+        * ``started_at``: required ISO 8601 datetime (the clip's recording
+          time; the storage key is derived from this).
+        * ``duration_s``: integer ≥ 0 — duration in seconds; ``0`` means
+          unknown (frontend can't always extract it).
+        * ``file``: the MP4/MOV/MKV/M4V bytes.
+
+    Behaviour:
+        * Enforces ``settings.max_upload_bytes`` (default 1 GiB). Exceeding
+          the cap — known up-front or detected mid-stream — returns
+          ``413 Payload Too Large`` without leaving partial bytes on disk.
+        * Hashes the body with SHA-256 while reading.
+        * Writes through :func:`app.storage.put_object`, so local and s3
+          backends are both supported.
+        * Inserts a ``clips`` row, writes a ``clip.uploaded`` audit row,
+          and commits everything atomically.
+
+    Tenant isolation: ``truck_id`` / ``driver_id`` are validated against
+    the caller's tenant. Cross-tenant references return ``404 not found``
+    so the endpoint can't be used to probe other tenants' fleets.
+    """
+    # ---- Validate truck belongs to caller's tenant ----------------------
+    truck_stmt = select(Truck).where(
+        Truck.id == truck_id, Truck.tenant_id == principal.tenant_id
+    )
+    truck = (await session.execute(truck_stmt)).scalar_one_or_none()
+    if truck is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="not found",
+        )
+
+    # ---- Validate driver belongs to caller's tenant (if provided) -------
+    driver: Driver | None = None
+    if driver_id is not None:
+        driver_stmt = select(Driver).where(
+            Driver.id == driver_id, Driver.tenant_id == principal.tenant_id
+        )
+        driver = (await session.execute(driver_stmt)).scalar_one_or_none()
+        if driver is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="not found",
+            )
+
+    # ---- Size cap (cheap up-front check) --------------------------------
+    max_bytes = settings.max_upload_bytes
+    declared_size = file.size
+    if declared_size is not None and declared_size > max_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="file too large",
+        )
+
+    # ---- Read into memory in chunks, hashing as we go -------------------
+    # We accumulate into a single ``bytes`` buffer because the existing
+    # ``storage.put_object`` API takes ``bytes | BinaryIO``; the local
+    # backend writes it atomically, the s3 backend hands it to boto3.
+    # Multi-megabyte clips fit comfortably in RAM; the cap (1 GiB) is the
+    # absolute upper bound, and we abort early if exceeded.
+    hasher = hashlib.sha256()
+    total = 0
+    chunks: list[bytes] = []
+    while True:
+        chunk = await file.read(_UPLOAD_CHUNK_BYTES)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            # Don't write partial bytes — bail out before touching storage.
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail="file too large",
+            )
+        hasher.update(chunk)
+        chunks.append(chunk)
+    body_bytes = b"".join(chunks)
+    sha256_hex = hasher.hexdigest()
+
+    # ---- Materialise the clip --------------------------------------------
+    clip_id = uuid4()
+    storage_key = build_clip_key(principal.tenant_id, started_at, clip_id)
+    content_type = file.content_type or "video/mp4"
+
+    # Write to storage BEFORE the DB insert so that a storage failure
+    # leaves us with no orphaned row. ``put_object`` re-checks the tenant
+    # prefix as a defence-in-depth measure.
+    await storage_module.put_object(
+        principal.tenant_id,
+        storage_key,
+        body_bytes,
+        content_type=content_type,
+    )
+
+    ended_at = started_at + timedelta(seconds=duration_s)
+    clip = Clip(
+        id=clip_id,
+        tenant_id=principal.tenant_id,
+        truck_id=truck.id,
+        driver_id=driver.id if driver is not None else None,
+        started_at=started_at,
+        ended_at=ended_at,
+        duration_s=duration_s,
+        storage_key=storage_key,
+        sha256=sha256_hex,
+        dashcam_firmware=None,
+    )
+    session.add(clip)
+    await session.flush()
+
+    await audit_record(
+        session,
+        principal=principal,
+        action="clip.uploaded",
+        target_type="clip",
+        target_id=clip_id,
+        payload={
+            "truck_id": str(truck_id),
+            "driver_id": str(driver_id) if driver_id is not None else None,
+            "file_size_bytes": total,
+            "source": "web",
+        },
+    )
+    await session.commit()
+
+    # Re-load with relationships so ``ClipDetail`` can flatten truck.label
+    # / driver.name. ``selectinload`` keeps it to one query.
+    refresh_stmt = (
+        select(Clip)
+        .options(selectinload(Clip.truck), selectinload(Clip.driver))
+        .where(Clip.id == clip_id, Clip.tenant_id == principal.tenant_id)
+    )
+    loaded = (await session.execute(refresh_stmt)).scalar_one()
+    return ClipDetail.model_validate(loaded)
 
 
 @router.get("/clips/{clip_id}", response_model=ClipDetail)

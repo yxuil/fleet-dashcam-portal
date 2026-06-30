@@ -188,6 +188,7 @@ PATCH  /me/preferences
 # Clips
 GET    /clips
 GET    /clips/{clip_id}
+POST   /clips/upload
 POST   /clips/{clip_id}/audit
 
 # Events

@@ -14,11 +14,13 @@
  *   - `q`          free-text filter on truck label (client-side only)
  */
 
-import { useCallback, useMemo } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 
 import { TruckDriverPicker } from "@/components/dashcam/TruckDriverPicker";
 import { TruckRowList } from "@/components/dashcam/TruckRowList";
+import { UploadModal } from "@/components/dashcam/UploadModal";
+import { Button } from "@/components/ui/Button";
 import { useDrivers } from "@/hooks/useDrivers";
 import { useTrucks } from "@/hooks/useTrucks";
 
@@ -69,6 +71,8 @@ export function DashcamPage() {
 
   const trucks = useTrucks();
   const drivers = useDrivers();
+
+  const [uploadOpen, setUploadOpen] = useState(false);
 
   const truckIds = filters.truck_id ? [filters.truck_id] : undefined;
 
@@ -134,7 +138,20 @@ export function DashcamPage() {
             className="h-9 rounded-md border border-input bg-background px-2 text-sm text-foreground"
           />
         </label>
+        <Button
+          type="button"
+          variant="outline"
+          onClick={() => setUploadOpen(true)}
+          data-testid="dashcam-upload-button"
+        >
+          Upload clips
+        </Button>
       </div>
+
+      <UploadModal
+        open={uploadOpen}
+        onClose={() => setUploadOpen(false)}
+      />
 
       <TruckRowList
         filters={{
